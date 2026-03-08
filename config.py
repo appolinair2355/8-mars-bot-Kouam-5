@@ -1,55 +1,96 @@
 """
-Configuration BACCARAT AI 🤖
-Bot de prédiction basé sur les cycles numériques
+Configuration du bot Baccarat AI
 """
-import os
 
-def parse_channel_id(env_var: str, default: str) -> int:
-    """Parse et formate l'ID de canal Telegram."""
-    value = os.getenv(env_var) or default
-    channel_id = int(value)
-    if channel_id > 0 and len(str(channel_id)) >= 10:
-        channel_id = -channel_id
-    return channel_id
+# ============================================================================
+# TELEGRAM API CREDENTIALS
+# ============================================================================
 
-# Canaux Telegram
-SOURCE_CHANNEL_ID = parse_channel_id('SOURCE_CHANNEL_ID', '-1002682552255')
-PREDICTION_CHANNEL_ID = parse_channel_id('PREDICTION_CHANNEL_ID', '-1002543915361')
+# Remplacez par vos valeurs réelles
+API_ID = 29177661  # Votre API ID Telegram (entier)
+API_HASH = "a8639172fa8d35dbfd8ea46286d349ab"  # Votre API Hash Telegram (string)
+BOT_TOKEN = "7815360317:AAGsrFzeUZrHOjujf5aY2UjlBj4GOblHSig"  # Token du bot
 
-# Authentification
-ADMIN_ID = int(os.getenv('ADMIN_ID') or '0')
-API_ID = int(os.getenv('API_ID') or '0')
-API_HASH = os.getenv('API_HASH') or ''
-BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
-TELEGRAM_SESSION = os.getenv('TELEGRAM_SESSION', '')
+# ============================================================================
+# ADMIN ET CANAUX
+# ============================================================================
 
-# Serveur
-PORT = int(os.getenv('PORT') or '10000')
+# ID de l'administrateur (votre ID Telegram)
+ADMIN_ID = 1190237801  # Remplacez par votre ID Telegram
 
-# Cycles de prédiction
+# ID du canal source (où arrivent les messages avec #N)
+# Format: -100xxxxxxxxxx ou juste les chiffres
+SOURCE_CHANNEL_ID = -1002682552255
+
+# ID du canal de prédiction (où envoyer les prédictions)
+# Le bot doit être administrateur avec droit d'envoi de messages
+PREDICTION_CHANNEL_ID = -1003725380926
+
+# ============================================================================
+# PARAMÈTRES DU SERVEUR WEB (pour Render/Heroku)
+# ============================================================================
+
+PORT = 10000  # Port pour le serveur web de health check
+
+# ============================================================================
+# CONFIGURATION DES CYCLES (Mode Standard/Hyper Serré)
+# ============================================================================
+
+# Intervalles entre les cycles pour chaque costume
 SUIT_CYCLES = {
-    '♦': {'start': 1, 'interval': 6},   # Carreau: 1, 7, 13, 19...
-    '♥': {'start': 1, 'interval': 6},   # Cœur: 1, 7, 13, 19...
-    '♣': {'start': 1, 'interval': 7},   # Trèfle: 1, 8, 15, 22...
-    '♠': {'start': 1, 'interval': 5},   # Pique: 1, 6, 11, 16...
+    '♠': {'start': 1, 'interval': 5},   # Pique: tous les 5 numéros
+    '♥': {'start': 1, 'interval': 6},   # Cœur: tous les 6 numéros
+    '♦': {'start': 1, 'interval': 6},   # Carreau: tous les 6 numéros
+    '♣': {'start': 1, 'interval': 7},   # Trèfle: tous les 7 numéros
 }
 
+# Liste des costumes
 ALL_SUITS = ['♠', '♥', '♦', '♣']
 
+# Affichage des costumes
 SUIT_DISPLAY = {
-    '♠': '♠️',
-    '♥': '❤️',
-    '♦': '♦️',
-    '♣': '♣️'
+    '♠': '♠️ Pique',
+    '♥': '❤️ Cœur',
+    '♦': '♦️ Carreau',
+    '♣': '♣️ Trèfle'
 }
 
-# Paramètres
-CONSECUTIVE_FAILURES_NEEDED = 2
-MAX_PENDING_PREDICTIONS = 10
-BLOCK_DURATION_AFTER_LOSS = 5
-ENABLE_TIME_RESTRICTION = True
+# ============================================================================
+# PARAMÈTRES DE JEU
+# ============================================================================
 
-# Ancienne config (compatibilité)
-SUIT_MAPPING = {'♠': '♣', '♥': '♠', '♦': '♥', '♣': '♦'}
-SUIT_SEQUENCE = ['♠', '♥', '♦', '♣']
-PREDICTION_INTERVAL = 4
+# Nombre de tours consécutifs avant prédiction (pour les cycles)
+CONSECUTIVE_FAILURES_NEEDED = 2
+
+# Nombre de numéros par tour en mode standard
+NUMBERS_PER_TOUR = 3
+
+# ============================================================================
+# PARAMÈTRES COMPTEUR2 (NOUVEAU)
+# ============================================================================
+
+# Seuil B par défaut pour le Compteur2 (nombre de manques avant prédiction)
+COMPTEUR2_SEUIL_B_DEFAULT = 2
+
+# Activation par défaut du Compteur2
+COMPTEUR2_ACTIVE_DEFAULT = True
+
+# ============================================================================
+# PARAMÈTRES DE SÉCURITÉ
+# ============================================================================
+
+# Nombre de numéros sans prédiction avant redémarrage forcé
+FORCE_RESTART_THRESHOLD = 20
+
+# Numéro de jeu pour reset automatique
+RESET_AT_GAME_NUMBER = 1440
+
+# Timeout pour considérer une prédiction comme bloquée (minutes)
+PREDICTION_TIMEOUT_MINUTES = 30
+
+# ============================================================================
+# PARAMÈTRES DE LOGGING
+# ============================================================================
+
+LOG_LEVEL = "INFO"  # DEBUG, INFO, WARNING, ERROR
+LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
