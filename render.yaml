@@ -1,0 +1,40 @@
+# Render.com Configuration for BACCARAT AI 🤖
+# Déploiement en tant que Web Service (nécessaire pour le health check)
+
+services:
+  - type: web
+    name: baccarat-ai
+    runtime: python
+    plan: free  # ou 'starter', 'standard', etc.
+
+    # Commandes de build et démarrage
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+
+    # Health check (obligatoire pour Render)
+    healthCheckPath: /health
+
+    # Variables d'environnement (à remplir dans le dashboard Render)
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: SOURCE_CHANNEL_ID
+        sync: false
+      - key: PREDICTION_CHANNEL_ID
+        sync: false
+      - key: TELEGRAM_SESSION
+        sync: false
+        value: ""  # Sera rempli automatiquement après premier démarrage
+      - key: PORT
+        value: 10000
+      - key: PYTHON_VERSION
+        value: 3.11.0
+
+    # Auto-deploy sur push
+    autoDeploy: true

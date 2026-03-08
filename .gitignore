@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+.env
+.env.local
+venv/
+
+# Telegram
+*.session
+*.session-journal
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
