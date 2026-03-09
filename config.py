@@ -8,7 +8,7 @@ Configuration du bot Baccarat AI - Version sans cycles
 
 API_ID = 29177661
 API_HASH = "a8639172fa8d35dbfd8ea46286d349ab"
-BOT_TOKEN = "7815360317:AAGsrFzeUZrHOjujf5aY2UjlBj4GOblHSig"
+BOT_TOKEN = "7663403310:AAHEmW-FzB1hvV9_FXTJxcdGt_hjrc3dJSk"
 
 # ============================================================================
 # ADMIN ET CANAUX
@@ -16,7 +16,7 @@ BOT_TOKEN = "7815360317:AAGsrFzeUZrHOjujf5aY2UjlBj4GOblHSig"
 
 ADMIN_ID = 1190237801
 SOURCE_CHANNEL_ID = -1002682552255
-PREDICTION_CHANNEL_ID = -1003725380926
+PREDICTION_CHANNEL_ID = -1003501017916
 
 # ============================================================================
 # PARAMÈTRES DU SERVEUR WEB
