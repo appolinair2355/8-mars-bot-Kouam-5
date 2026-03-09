@@ -5,7 +5,7 @@ import logging
 import sys
 import random
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Dict, Set, Tuple
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
@@ -52,6 +52,22 @@ waiting_finalization: Dict[int, dict] = {}
 compteur2_trackers: Dict[str, 'Compteur2Tracker'] = {}
 compteur2_seuil_B = 2  # Seuil par défaut
 compteur2_active = True
+
+# NOUVEAU: Seuil B spécial pour costumes bloqués (minimum 7 par défaut)
+B_SPECIAL = 7
+
+# NOUVEAU: Costumes bloqués pour Distribution #R (suit -> bool)
+blocked_suits_for_distribution: Dict[str, bool] = {
+    '♦': False,  # 1 Carreau
+    '♠': False,  # 2 Pique
+    '♣': False,  # 3 Trèfle
+    '♥': False,  # 4 Cœur
+}
+
+# NOUVEAU: Compteur1 - Gestion des costumes présents consécutifs
+compteur1_trackers: Dict[str, 'Compteur1Tracker'] = {}
+compteur1_history: List[Dict] = []  # Historique des séries ≥3
+MIN_CONSECUTIVE_FOR_STATS = 3  # Minimum pour apparaître dans /stats
 
 # Gestion des écarts entre prédictions
 MIN_GAP_BETWEEN_PREDICTIONS = 2  # Écart minimum entre 2 prédictions
@@ -154,7 +170,7 @@ async def resolve_channel(entity_id):
         return None
 
 # ============================================================================
-# CLASSE COMPTEUR2 TRACKER
+# CLASSES TRACKERS
 # ============================================================================
 
 @dataclass
@@ -186,6 +202,106 @@ class Compteur2Tracker:
     
     def check_threshold(self, seuil_B: int) -> bool:
         return self.counter >= seuil_B
+
+# NOUVEAU: Compteur1 Tracker (costumes présents consécutifs)
+@dataclass
+class Compteur1Tracker:
+    """Tracker pour le compteur1 (costumes présents consécutivement)."""
+    suit: str
+    counter: int = 0
+    start_game: int = 0  # Jeu où la série a commencé
+    last_game: int = 0   # Dernier jeu où vu
+    
+    def get_display_name(self) -> str:
+        names = {
+            '♠': '♠️ Pique',
+            '♥': '❤️ Cœur',
+            '♦': '♦️ Carreau',
+            '♣': '♣️ Trèfle'
+        }
+        return names.get(self.suit, self.suit)
+    
+    def increment(self, game_number: int):
+        if self.counter == 0:
+            self.start_game = game_number
+        self.counter += 1
+        self.last_game = game_number
+        logger.info(f"🎯 Compteur1 {self.suit}: {self.counter} consécutifs (jeu #{game_number})")
+    
+    def reset(self, game_number: int):
+        # Sauvegarder dans l'historique si ≥ 3 avant reset
+        if self.counter >= MIN_CONSECUTIVE_FOR_STATS:
+            save_compteur1_series(self.suit, self.counter, self.start_game, self.last_game)
+        
+        if self.counter > 0:
+            logger.info(f"🔄 Compteur1 {self.suit}: reset de {self.counter} à 0 (manqué au jeu #{game_number})")
+        self.counter = 0
+        self.start_game = 0
+        self.last_game = 0
+    
+    def get_status(self) -> str:
+        if self.counter == 0:
+            return "0"
+        return f"{self.counter} (depuis #{self.start_game})"
+
+# ============================================================================
+# FONCTIONS COMPTeur1 (NOUVEAU)
+# ============================================================================
+
+def save_compteur1_series(suit: str, count: int, start_game: int, end_game: int):
+    """Sauvegarde une série de Compteur1 dans l'historique."""
+    global compteur1_history
+    
+    entry = {
+        'suit': suit,
+        'count': count,
+        'start_game': start_game,
+        'end_game': end_game,
+        'timestamp': datetime.now()
+    }
+    
+    compteur1_history.insert(0, entry)
+    
+    # Garder seulement les 100 dernières entrées
+    if len(compteur1_history) > 100:
+        compteur1_history = compteur1_history[:100]
+    
+    logger.info(f"💾 Série Compteur1 sauvegardée: {suit} {count} fois (jeux #{start_game}-#{end_game})")
+
+def get_compteur1_stats() -> Dict[str, List[Dict]]:
+    """Organise l'historique par costume."""
+    stats = {'♥': [], '♠': [], '♦': [], '♣': []}
+    
+    for entry in compteur1_history:
+        suit = entry['suit']
+        if suit in stats:
+            stats[suit].append(entry)
+    
+    return stats
+
+def get_compteur1_record(suit: str) -> int:
+    """Retourne le record (max consécutifs) pour un costume."""
+    max_count = 0
+    for entry in compteur1_history:
+        if entry['suit'] == suit and entry['count'] > max_count:
+            max_count = entry['count']
+    return max_count
+
+def update_compteur1(game_number: int, first_group: str):
+    """Met à jour le Compteur1 basé sur les costumes présents."""
+    global compteur1_trackers
+    
+    suits_in_first = set(get_suits_in_group(first_group))
+    
+    for suit in ALL_SUITS:
+        tracker = compteur1_trackers[suit]
+        
+        if suit in suits_in_first:
+            # Costume présent → incrémenter
+            tracker.increment(game_number)
+        else:
+            # Costume manquant → reset (et sauvegarder si nécessaire)
+            tracker.reset(game_number)
 
 # ============================================================================
 # FONCTIONS D'HISTORIQUE
@@ -258,12 +374,13 @@ def update_prediction_in_history(game_number: int, suit: str, verified_by_game: 
 # ============================================================================
 
 def initialize_trackers():
-    """Initialise les trackers Compteur2."""
-    global compteur2_trackers
+    """Initialise les trackers Compteur1 et Compteur2."""
+    global compteur2_trackers, compteur1_trackers
     
     for suit in ALL_SUITS:
         compteur2_trackers[suit] = Compteur2Tracker(suit=suit)
-        logger.info(f"📊 Compteur2 {suit}: initialisé")
+        compteur1_trackers[suit] = Compteur1Tracker(suit=suit)
+        logger.info(f"📊 Trackers {suit}: Compteur1 & Compteur2 initialisés")
 
 def is_message_finalized(message: str) -> bool:
     if '⏰' in message:
@@ -300,7 +417,6 @@ def block_suit(suit: str, minutes: int = 5):
 
 def format_pause_message(duration_min: int, remaining_seconds: int) -> str:
     """Formate le message de pause avec temps dynamique."""
-    # CORRECTION: Si temps écoulé ou négatif, afficher message de fin
     if remaining_seconds <= 0:
         return f"""⏸️ PAUSE TERMINÉE
 
@@ -335,9 +451,7 @@ async def update_pause_message(duration_min: int, remaining_seconds: int):
         if not prediction_entity:
             return
         
-        # CORRECTION: Ne jamais afficher de temps négatif
         display_seconds = max(0, remaining_seconds)
-        
         msg = format_pause_message(duration_min, display_seconds)
         
         await client.edit_message(prediction_entity, pause_message_id, msg, parse_mode='markdown')
@@ -351,7 +465,6 @@ async def pause_countdown_task(duration_min: int):
     
     total_seconds = duration_min * 60
     
-    # CORRECTION: Boucle de total_seconds down to 1 (pas 0 ou -1)
     for i in range(total_seconds, 0, -1):
         if not pause_active:
             logger.info("⏸️ Pause annulée manuellement")
@@ -360,7 +473,6 @@ async def pause_countdown_task(duration_min: int):
         await update_pause_message(duration_min, i)
         await asyncio.sleep(1)
     
-    # CORRECTION: Quand on sort de la boucle (i=0), temps écoulé
     if pause_active:
         logger.info("⏸️ Temps écoulé, fin de pause automatique")
         await end_pause()
@@ -373,13 +485,11 @@ async def start_pause():
         logger.warning("⏸️ Pause déjà active")
         return
     
-    # Déterminer la durée selon le cycle
     duration = PAUSE_CYCLE[pause_cycle_index % len(PAUSE_CYCLE)]
     
     pause_active = True
     pause_end_time = datetime.now() + timedelta(minutes=duration)
     
-    # Envoyer message initial
     try:
         prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
         if prediction_entity:
@@ -387,7 +497,6 @@ async def start_pause():
             sent = await client.send_message(prediction_entity, msg, parse_mode='markdown')
             pause_message_id = sent.id
             
-            # Démarrer la tâche de mise à jour
             pause_task = asyncio.create_task(pause_countdown_task(duration))
             
             logger.info(f"⏸️ PAUSE DÉMARRÉE: {duration} min (cycle index: {pause_cycle_index})")
@@ -403,11 +512,10 @@ async def end_pause():
         return
     
     pause_active = False
-    pause_counter = 0  # Reset compteur
-    pause_cycle_index += 1  # Passer au cycle suivant
+    pause_counter = 0
+    pause_cycle_index += 1
     pause_end_time = None
     
-    # Annuler la tâche si encore active
     if pause_task and not pause_task.done():
         pause_task.cancel()
         try:
@@ -415,13 +523,11 @@ async def end_pause():
         except asyncio.CancelledError:
             pass
     
-    # Envoyer message de reprise
     try:
         prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
         if prediction_entity and pause_message_id:
             resume_msg = format_resume_message()
             
-            # Éditer le dernier message de pause avec message de reprise
             await client.edit_message(
                 prediction_entity, 
                 pause_message_id, 
@@ -431,10 +537,8 @@ async def end_pause():
             
             logger.info(f"▶️ PAUSE TERMINÉE - Reprise avec: {resume_msg[:50]}...")
             
-            # Reset message_id pour prochaine pause
             pause_message_id = None
             
-            # CORRECTION: Traiter immédiatement la file d'attente si des prédictions attendent
             if prediction_queue:
                 logger.info(f"📤 {len(prediction_queue)} prédictions en attente, traitement...")
                 await process_prediction_queue(current_game_number)
@@ -447,14 +551,14 @@ def increment_pause_counter():
     global pause_counter, pause_active
     
     if pause_active:
-        return False  # Déjà en pause
+        return False
     
     pause_counter += 1
     logger.info(f"⏸️ Compteur pause: {pause_counter}/{PREDICTIONS_BEFORE_PAUSE}")
     
     if pause_counter >= PREDICTIONS_BEFORE_PAUSE:
         logger.info("⏸️ Seuil atteint, pause programmée après vérification")
-        return True  # Indique qu'il faut faire pause après vérification
+        return True
     
     return False
 
@@ -465,13 +569,10 @@ async def check_and_trigger_pause(game_number: int):
     if pause_active:
         return
     
-    # Vérifier si c'est la 4ème prédiction qui vient de finir
     if pause_counter >= PREDICTIONS_BEFORE_PAUSE:
-        # Vérifier que c'est bien la dernière prédiction envoyée qui se termine
         if game_number in pending_predictions:
-            return  # Encore en cours
+            return
         
-        # La 4ème prédiction est terminée, lancer la pause
         await start_pause()
 
 # ============================================================================
@@ -563,7 +664,6 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
     
     success = False
     
-    # 1. TOUJOURS envoyer au canal principal
     if PREDICTION_CHANNEL_ID:
         msg_id = await send_prediction_to_channel(
             PREDICTION_CHANNEL_ID, game_number, suit, prediction_type, is_secondary=False
@@ -589,19 +689,16 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
             add_prediction_to_history(game_number, suit, [game_number, game_number + 1, game_number + 2], prediction_type)
             success = True
     
-    # 2. Envoyer au canal secondaire Distribution si défini et type = distribution
     if prediction_type == 'distribution' and DISTRIBUTION_CHANNEL_ID:
         await send_prediction_to_channel(
             DISTRIBUTION_CHANNEL_ID, game_number, suit, prediction_type, is_secondary=True
         )
     
-    # 3. Envoyer au canal secondaire Compteur2 si défini et type = compteur2
     elif prediction_type == 'compteur2' and COMPTEUR2_CHANNEL_ID:
         await send_prediction_to_channel(
             COMPTEUR2_CHANNEL_ID, game_number, suit, prediction_type, is_secondary=True
         )
     
-    # 4. Incrémenter compteur de pause (si succès et pas déjà en pause)
     if success and not pause_active:
         need_pause = increment_pause_counter()
         if need_pause:
@@ -612,7 +709,6 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
 async def update_prediction_message(game_number: int, status: str, rattrapage: int = 0):
     """Met à jour le statut d'une prédiction (uniquement canal principal)."""
     if game_number not in pending_predictions:
-        # Vérifier si c'était la 4ème prédiction qui vient de finir
         await check_and_trigger_pause(game_number)
         return
     
@@ -639,7 +735,6 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
         
         del pending_predictions[game_number]
         
-        # Vérifier si pause nécessaire après cette fin de prédiction
         await check_and_trigger_pause(game_number)
         
     except Exception as e:
@@ -730,7 +825,7 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
     return False
 
 # ============================================================================
-# GESTION #R ET COMPTEUR2 (CORRIGÉ - #R + #X ignoré)
+# GESTION #R ET COMPTEUR2 (MODIFIÉ - avec blocage costumes)
 # ============================================================================
 
 def extract_first_two_groups(message: str) -> tuple:
@@ -742,9 +837,10 @@ def extract_first_two_groups(message: str) -> tuple:
     return "", ""
 
 def check_distribution_rule(game_number: int, message_text: str) -> Optional[tuple]:
-    global DISTRIBUTION_PLUS_VALUE
+    """Vérifie la règle de distribution #R avec gestion des costumes bloqués."""
+    global DISTRIBUTION_PLUS_VALUE, blocked_suits_for_distribution
     
-    # CORRECTION IMPORTANTE: Si #R ET #X sont présents ensemble, ne pas utiliser cette règle
+    # Ignorer si #R et #X ensemble
     if '#R' in message_text and '#X' in message_text:
         logger.info(f"🚫 #R et #X détectés ensemble au jeu #{game_number} - Distribution ignorée")
         return None
@@ -766,6 +862,12 @@ def check_distribution_rule(game_number: int, message_text: str) -> Optional[tup
     
     if len(missing_suits) == 1:
         missing_suit = list(missing_suits)[0]
+        
+        # NOUVEAU: Vérifier si ce costume est bloqué pour Distribution #R
+        if blocked_suits_for_distribution.get(missing_suit, False):
+            logger.info(f"🚫 {missing_suit} est BLOQUÉ pour Distribution #R - Prédiction ignorée")
+            return None
+        
         prediction_number = game_number + DISTRIBUTION_PLUS_VALUE
         logger.info(f"🎯 #R DÉTECTÉ: {missing_suit} manquant → Prédiction #{prediction_number} (base #{game_number} + {DISTRIBUTION_PLUS_VALUE})")
         return (missing_suit, prediction_number)
@@ -773,7 +875,8 @@ def check_distribution_rule(game_number: int, message_text: str) -> Optional[tup
     return None
 
 def update_compteur2(game_number: int, first_group: str):
-    global compteur2_trackers, compteur2_seuil_B
+    """Met à jour Compteur2 avec gestion spéciale pour costumes bloqués."""
+    global compteur2_trackers, compteur2_seuil_B, B_SPECIAL, blocked_suits_for_distribution
     
     suits_in_first = set(get_suits_in_group(first_group))
     
@@ -786,12 +889,26 @@ def update_compteur2(game_number: int, first_group: str):
             tracker.increment(game_number)
 
 def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
-    global compteur2_trackers, compteur2_seuil_B
+    """Retourne les prédictions prêtes selon Compteur2 avec seuils adaptés."""
+    global compteur2_trackers, compteur2_seuil_B, B_SPECIAL, blocked_suits_for_distribution
     
     ready = []
     for suit in ALL_SUITS:
         tracker = compteur2_trackers[suit]
-        if tracker.check_threshold(compteur2_seuil_B):
+        
+        # Déterminer le seuil à utiliser
+        if blocked_suits_for_distribution.get(suit, False):
+            # Costume bloqué: utiliser B_SPECIAL (minimum 7)
+            effective_B = max(B_SPECIAL, 7)
+            is_ready = tracker.counter >= effective_B
+            if is_ready:
+                logger.info(f"🔓 {suit} prêt avec B_SPECIAL={effective_B} (costume bloqué)")
+        else:
+            # Costume normal: utiliser compteur2_seuil_B
+            effective_B = compteur2_seuil_B
+            is_ready = tracker.check_threshold(effective_B)
+        
+        if is_ready:
             pred_number = current_game + 2
             ready.append((suit, pred_number))
             tracker.reset(current_game)
@@ -805,26 +922,22 @@ def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
 def can_accept_prediction(pred_number: int) -> bool:
     global prediction_queue, pending_predictions, last_prediction_number_sent, MIN_GAP_BETWEEN_PREDICTIONS, pause_active
     
-    # Si en pause, rejeter toutes les nouvelles prédictions
     if pause_active:
         logger.info(f"⛔ En pause, prédiction #{pred_number} rejetée")
         return False
     
-    # Vérifier écart avec la dernière prédiction envoyée
     if last_prediction_number_sent > 0:
         gap = pred_number - last_prediction_number_sent
         if gap < MIN_GAP_BETWEEN_PREDICTIONS:
             logger.info(f"⛔ Écart insuffisant avec dernier envoyé (#{last_prediction_number_sent}): {gap} < {MIN_GAP_BETWEEN_PREDICTIONS}")
             return False
     
-    # Vérifier écart avec toutes les prédictions en cours de vérification
     for existing_num in pending_predictions.keys():
         gap = abs(pred_number - existing_num)
         if gap < MIN_GAP_BETWEEN_PREDICTIONS:
             logger.info(f"⛔ Écart insuffisant avec prédiction en cours (#{existing_num}): {gap} < {MIN_GAP_BETWEEN_PREDICTIONS}")
             return False
     
-    # Vérifier écart avec toutes les prédictions dans la file d'attente
     for queued_pred in prediction_queue:
         existing_num = queued_pred['game_number']
         gap = abs(pred_number - existing_num)
@@ -837,18 +950,15 @@ def can_accept_prediction(pred_number: int) -> bool:
 def add_to_prediction_queue(game_number: int, suit: str, prediction_type: str) -> bool:
     global prediction_queue, pause_active
     
-    # Si en pause, ne pas ajouter à la file
     if pause_active:
         logger.info(f"⏸️ En pause, #{game_number} non ajouté")
         return False
     
-    # Vérifier si déjà dans la file
     for pred in prediction_queue:
         if pred['game_number'] == game_number:
             logger.info(f"⚠️ Prédiction #{game_number} déjà dans la file")
             return False
     
-    # Vérifier l'écart dynamique
     if not can_accept_prediction(game_number):
         logger.info(f"❌ Prédiction #{game_number} rejetée - écart insuffisant")
         return False
@@ -869,7 +979,6 @@ def add_to_prediction_queue(game_number: int, suit: str, prediction_type: str) -
 async def process_prediction_queue(current_game: int):
     global prediction_queue, pending_predictions, pause_active
     
-    # Si en pause, ne pas traiter la file
     if pause_active:
         return
     
@@ -880,9 +989,7 @@ async def process_prediction_queue(current_game: int):
         suit = pred['suit']
         pred_type = pred['type']
         
-        # Condition d'envoi: canal à N-2 ou plus proche
         if current_game >= pred_number - PREDICTION_SEND_AHEAD:
-            # Vérifier qu'on n'a pas déjà une prédiction en cours qui bloque
             if pending_predictions:
                 can_send = True
                 for active_num in pending_predictions.keys():
@@ -895,7 +1002,6 @@ async def process_prediction_queue(current_game: int):
                 if not can_send:
                     continue
             
-            # Envoyer la prédiction (multi-canaux)
             logger.info(f"📤 Envoi depuis file: #{pred_number} (canal à #{current_game})")
             success = await send_prediction_multi_channel(pred_number, suit, pred_type)
             
@@ -904,13 +1010,12 @@ async def process_prediction_queue(current_game: int):
             else:
                 logger.warning(f"⚠️ Échec envoi #{pred_number}, conservation dans file")
     
-    # Nettoyer la file
     for pred in to_remove:
         prediction_queue.remove(pred)
         logger.info(f"✅ #{pred['game_number']} retiré de la file. Restant: {len(prediction_queue)}")
 
 # ============================================================================
-# TRAITEMENT DES MESSAGES (CORRIGÉ)
+# TRAITEMENT DES MESSAGES (CORRIGÉ avec Compteur1)
 # ============================================================================
 
 async def process_game_result(game_number: int, message_text: str):
@@ -919,14 +1024,14 @@ async def process_game_result(game_number: int, message_text: str):
     current_game_number = game_number
     last_source_game_number = game_number
     
-    # CORRECTION: Vérifier si la pause devrait être terminée avant tout traitement
+    # Vérifier si pause expirée
     if pause_active and pause_end_time:
         remaining = (pause_end_time - datetime.now()).total_seconds()
         if remaining <= 0:
             logger.info("⏸️ Pause expirée détectée, reprise automatique")
             await end_pause()
     
-    # Vérification auto-reset uniquement au #1440
+    # Reset auto à #1440
     if current_game_number >= 1440:
         logger.warning(f"🚨 RESET #1440 atteint")
         await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint")
@@ -944,18 +1049,20 @@ async def process_game_result(game_number: int, message_text: str):
     
     add_to_history(game_number, message_text, first_group, suits_in_first)
     
+    # NOUVEAU: Mettre à jour Compteur1 (présences consécutives)
+    update_compteur1(game_number, first_group)
+    
     # Vérification des prédictions existantes
     await check_prediction_result(game_number, first_group)
     
-    # Traiter la file d'attente (si pas en pause, ou si pause vient de finir)
+    # Traiter la file d'attente
     await process_prediction_queue(game_number)
     
-    # Si en pause, ne pas détecter de nouvelles prédictions
     if pause_active:
         logger.info(f"⏸️ En pause, pas de nouvelle détection")
         return
     
-    # Distribution #R - CORRECTION: Ignorer si #R et #X ensemble
+    # Distribution #R (avec gestion blocage)
     distribution_result = check_distribution_rule(game_number, message_text)
     if distribution_result:
         suit, pred_num = distribution_result
@@ -963,7 +1070,7 @@ async def process_game_result(game_number: int, message_text: str):
         if added:
             logger.info(f"🎯 Distribution: #{pred_num} en file d'attente")
     
-    # Compteur2 - Ajouter à la file si écart OK (fonctionne toujours)
+    # Compteur2 (avec seuils adaptés)
     if compteur2_active:
         update_compteur2(game_number, first_group)
         
@@ -1036,7 +1143,6 @@ async def handle_edited_message(event):
 # ============================================================================
 
 async def notify_admin_reset(reason: str, stats: int, queue_stats: int):
-    """Envoie une notification de reset à l'admin en privé."""
     if not ADMIN_ID or ADMIN_ID == 0:
         logger.warning("⚠️ ADMIN_ID non configuré, impossible de notifier")
         return
@@ -1067,12 +1173,11 @@ async def auto_reset_system():
     
     while True:
         try:
-            await asyncio.sleep(60)  # Vérifier chaque minute
+            await asyncio.sleep(60)
             
-            # CORRECTION: Vérifier si la pause est bloquée (temps dépassé mais toujours active)
             if pause_active and pause_end_time:
                 remaining = (pause_end_time - datetime.now()).total_seconds()
-                if remaining <= -30:  # 30 secondes de marge après expiration
+                if remaining <= -30:
                     logger.warning("🚨 Pause bloquée détectée (temps dépassé), auto-correction...")
                     await end_pause()
                     
@@ -1084,11 +1189,16 @@ async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time, waiting_finalization
     global last_prediction_number_sent, compteur2_trackers, prediction_queue
     global pause_active, pause_counter, pause_cycle_index, pause_message_id, pause_end_time, pause_task
+    global compteur1_trackers, compteur1_history
     
     stats = len(pending_predictions)
     queue_stats = len(prediction_queue)
     
-    # Annuler pause si active
+    # Sauvegarder les séries en cours avant reset
+    for tracker in compteur1_trackers.values():
+        if tracker.counter >= MIN_CONSECUTIVE_FOR_STATS:
+            save_compteur1_series(tracker.suit, tracker.counter, tracker.start_game, tracker.last_game)
+    
     if pause_active:
         pause_active = False
         if pause_task and not pause_task.done():
@@ -1104,6 +1214,11 @@ async def perform_full_reset(reason: str):
         tracker.counter = 0
         tracker.last_increment_game = 0
     
+    for tracker in compteur1_trackers.values():
+        tracker.counter = 0
+        tracker.start_game = 0
+        tracker.last_game = 0
+    
     pending_predictions.clear()
     waiting_finalization.clear()
     prediction_queue.clear()
@@ -1111,20 +1226,256 @@ async def perform_full_reset(reason: str):
     last_prediction_number_sent = 0
     suit_block_until.clear()
     
-    # Reset compteur pause aussi
     pause_counter = 0
     pause_cycle_index = 0
     
-    logger.info(f"🔄 {reason} - {stats} actives cleared, {queue_stats} file cleared, Compteur2 reset, Pause reset")
+    logger.info(f"🔄 {reason} - {stats} actives cleared, {queue_stats} file cleared, Compteurs reset")
     
     await notify_admin_reset(reason, stats, queue_stats)
 
 # ============================================================================
-# COMMANDES ADMIN
+# COMMANDES ADMIN (NOUVELLES COMMANDES AJOUTÉES)
 # ============================================================================
 
+# NOUVEAU: Commande /block - Bloquer/débloquer costumes pour Distribution #R
+async def cmd_block(event):
+    global blocked_suits_for_distribution, B_SPECIAL
+    
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    
+    suit_map = {
+        '1': ('♦', '♦️ Carreau'),
+        '2': ('♠', '♠️ Pique'),
+        '3': ('♣', '♣️ Trèfle'),
+        '4': ('♥', '❤️ Cœur')
+    }
+    
+    try:
+        parts = event.message.message.split()
+        
+        # Afficher statut
+        if len(parts) == 1:
+            lines = [
+                "🚫 **BLOCAGE DISTRIBUTION #R**",
+                "",
+                "Costumes bloqués (uniquement Compteur2 autorisé):",
+                ""
+            ]
+            
+            any_blocked = False
+            for num, (suit, name) in suit_map.items():
+                status = "🔴 BLOQUÉ" if blocked_suits_for_distribution[suit] else "🟢 Libre"
+                lines.append(f"{num}. {name}: {status}")
+                if blocked_suits_for_distribution[suit]:
+                    any_blocked = True
+            
+            lines.append(f"\n📊 B spécial pour bloqués: **{B_SPECIAL}** (minimum requis)")
+            
+            lines.append(f"\n**Usage:**")
+            lines.append(f"`/block 1` - Bloquer ♦️ Carreau")
+            lines.append(f"`/block 2` - Bloquer ♠️ Pique")
+            lines.append(f"`/block 3` - Bloquer ♣️ Trèfle")
+            lines.append(f"`/block 4` - Bloquer ❤️ Cœur")
+            lines.append(f"`/block off` - Tout débloquer")
+            
+            await event.respond("\n".join(lines))
+            return
+        
+        arg = parts[1].lower()
+        
+        if arg == 'off':
+            # Débloquer tous
+            for suit in blocked_suits_for_distribution:
+                blocked_suits_for_distribution[suit] = False
+            await event.respond("✅ **Tous les costumes débloqués pour Distribution #R**")
+            logger.info("Admin débloque tous les costumes pour #R")
+            return
+        
+        if arg in suit_map:
+            suit, name = suit_map[arg]
+            blocked_suits_for_distribution[suit] = True
+            await event.respond(
+                f"🚫 **{name} BLOQUÉ pour Distribution #R**\n\n"
+                f"• Seul Compteur2 pourra prédire ce costume\n"
+                f"• B spécial requis: **{B_SPECIAL}** (au lieu de {compteur2_seuil_B})\n"
+                f"• Utilisez `/bspecial` pour changer le B spécial"
+            )
+            logger.info(f"Admin bloque {suit} ({name}) pour Distribution #R")
+        else:
+            await event.respond("❌ Usage: `/block [1-4/off]`\n1=♦️ 2=♠️ 3=♣️ 4=❤️")
+            
+    except Exception as e:
+        logger.error(f"Erreur cmd_block: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+# NOUVEAU: Commande /bspecial - Définir le seuil B pour costumes bloqués
+async def cmd_bspecial(event):
+    global B_SPECIAL
+    
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    
+    try:
+        parts = event.message.message.split()
+        
+        if len(parts) == 1:
+            await event.respond(
+                f"📊 **SEUIL B SPÉCIAL**\n\n"
+                f"Valeur actuelle: **{B_SPECIAL}**\n\n"
+                f"Ce seuil s'applique aux costumes **bloqués** pour Distribution #R.\n"
+                f"Ils nécessiteront **{B_SPECIAL}** absences consécutives (Compteur2) "
+                f"au lieu de {compteur2_seuil_B}.\n\n"
+                f"**Usage:** `/bspecial [2-10]`\n"
+                f"Minimum recommandé: **7**"
+            )
+            return
+        
+        arg = parts[1]
+        
+        try:
+            b_val = int(arg)
+            if not 2 <= b_val <= 10:
+                await event.respond("❌ La valeur doit être entre 2 et 10")
+                return
+            
+            old_val = B_SPECIAL
+            B_SPECIAL = b_val
+            
+            await event.respond(
+                f"✅ **B spécial modifié: {old_val} → {b_val}**\n\n"
+                f"Les costumes bloqués nécessiteront maintenant **{b_val}** absences "
+                f"consécutives pour être prédits par Compteur2."
+            )
+            logger.info(f"Admin change B_SPECIAL: {old_val} → {b_val}")
+            
+        except ValueError:
+            await event.respond("❌ Usage: `/bspecial [2-10]`")
+            
+    except Exception as e:
+        logger.error(f"Erreur cmd_bspecial: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+# NOUVEAU: Commande /compteur1 - Voir le statut actuel du Compteur1
+async def cmd_compteur1(event):
+    global compteur1_trackers
+    
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    
+    try:
+        lines = [
+            "🎯 **COMPTEUR1** (Présences consécutives)",
+            "Reset à 0 si le costume manque",
+            ""
+        ]
+        
+        for suit in ALL_SUITS:
+            tracker = compteur1_trackers.get(suit)
+            if tracker:
+                if tracker.counter > 0:
+                    lines.append(f"{tracker.get_display_name()}: **{tracker.counter}** consécutifs (depuis #{tracker.start_game})")
+                else:
+                    lines.append(f"{tracker.get_display_name()}: 0")
+        
+        lines.append(f"\n**Usage:** `/stats` pour voir l'historique des séries ≥3")
+        
+        await event.respond("\n".join(lines))
+        
+    except Exception as e:
+        logger.error(f"Erreur cmd_compteur1: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+# NOUVEAU: Commande /stats - Voir l'historique des séries Compteur1
+async def cmd_stats(event):
+    global compteur1_history, compteur1_trackers
+    
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    
+    try:
+        lines = [
+            "📊 **STATISTIQUES COMPTEUR1**",
+            "Séries de présences consécutives (minimum 3)",
+            ""
+        ]
+        
+        # Sauvegarder les séries en cours avant affichage
+        for tracker in compteur1_trackers.values():
+            if tracker.counter >= MIN_CONSECUTIVE_FOR_STATS:
+                # Vérifier si déjà sauvegardée récemment
+                already_saved = False
+                for entry in compteur1_history[:5]:  # Vérifier 5 dernières
+                    if (entry['suit'] == tracker.suit and 
+                        entry['count'] == tracker.counter and
+                        entry['end_game'] == tracker.last_game):
+                        already_saved = True
+                        break
+                
+                if not already_saved:
+                    save_compteur1_series(tracker.suit, tracker.counter, tracker.start_game, tracker.last_game)
+        
+        # Organiser par costume
+        stats_by_suit = {'♥': [], '♠': [], '♦': [], '♣': []}
+        for entry in compteur1_history:
+            suit = entry['suit']
+            if suit in stats_by_suit:
+                stats_by_suit[suit].append(entry)
+        
+        suit_names = {
+            '♥': '❤️ Cœur',
+            '♠': '♠️ Pique', 
+            '♦': '♦️ Carreau',
+            '♣': '♣️ Trèfle'
+        }
+        
+        has_data = False
+        
+        for suit in ['♥', '♠', '♦', '♣']:
+            entries = stats_by_suit[suit]
+            if not entries:
+                continue
+            
+            has_data = True
+            record = get_compteur1_record(suit)
+            
+            lines.append(f"**{suit_names[suit]}** (Record: {record})")
+            
+            # Afficher les 5 dernières séries
+            for i, entry in enumerate(entries[:5], 1):
+                count = entry['count']
+                start = entry['start_game']
+                end = entry['end_game']
+                is_record = "⭐" if count == record else ""
+                lines.append(f"  {i}. {count} fois (jeux #{start}-#{end}) {is_record}")
+            
+            lines.append("")
+        
+        if not has_data:
+            lines.append("❌ Aucune série ≥3 enregistrée encore")
+            lines.append("Les séries apparaîtront automatiquement quand un costume")
+            lines.append("sera présent 3+ fois consécutivement.")
+        
+        await event.respond("\n".join(lines))
+        
+    except Exception as e:
+        logger.error(f"Erreur cmd_stats: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+# Commandes existantes (pause, config, etc.)
 async def cmd_pause(event):
-    """Commande /pause - Gérer le système de pause."""
     global pause_active, pause_counter, pause_cycle_index, PAUSE_CYCLE, PREDICTIONS_BEFORE_PAUSE
     
     if event.is_group or event.is_channel:
@@ -1136,11 +1487,9 @@ async def cmd_pause(event):
     try:
         parts = event.message.message.split()
         
-        # Afficher statut
         if len(parts) == 1:
             status_pause = "🟢 ACTIVE" if pause_active else "🔴 INACTIVE"
             
-            # Calculer temps restant si actif
             time_info = ""
             if pause_active and pause_end_time:
                 remaining = int((pause_end_time - datetime.now()).total_seconds())
@@ -1194,7 +1543,6 @@ async def cmd_pause(event):
         await event.respond(f"❌ Erreur: {e}")
 
 async def cmd_pausecycle(event):
-    """Commande /pausecycle - Modifier le cycle de pause."""
     global PAUSE_CYCLE
     
     if event.is_group or event.is_channel:
@@ -1206,7 +1554,6 @@ async def cmd_pausecycle(event):
     try:
         parts = event.message.message.split()
         
-        # Afficher cycle actuel
         if len(parts) == 1:
             cycle_text = f"🔄 **CYCLE DE PAUSE**\n\nCycle actuel: **{PAUSE_CYCLE}** minutes\n\nOrdre des pauses:\n"
             
@@ -1217,10 +1564,8 @@ async def cmd_pausecycle(event):
             await event.respond(cycle_text)
             return
         
-        # Modifier cycle
         arg = parts[1]
         try:
-            # Parser "3,5,4" ou "3, 5, 4"
             new_cycle = [int(x.strip()) for x in arg.split(',')]
             
             if len(new_cycle) < 1:
@@ -1249,7 +1594,6 @@ async def cmd_pausecycle(event):
         await event.respond(f"❌ Erreur: {e}")
 
 async def cmd_pauseadd(event):
-    """Commande /pauseadd - Ajouter une expression de reprise."""
     global RESUME_EXPRESSIONS
     
     if event.is_group or event.is_channel:
@@ -1295,10 +1639,6 @@ async def cmd_pauseadd(event):
     except Exception as e:
         logger.error(f"Erreur cmd_pauseadd: {e}")
         await event.respond(f"❌ Erreur: {e}")
-
-# ============================================================================
-# AUTRES COMMANDES (inchangées)
-# ============================================================================
 
 async def cmd_plus(event):
     global DISTRIBUTION_PLUS_VALUE
@@ -1383,7 +1723,6 @@ async def cmd_gap(event):
         await event.respond(f"❌ Erreur: {e}")
 
 async def cmd_canal_distribution(event):
-    """Commande /canaldistribution - Gérer le canal de redirection Distribution #R"""
     global DISTRIBUTION_CHANNEL_ID
     
     if event.is_group or event.is_channel:
@@ -1440,7 +1779,6 @@ async def cmd_canal_distribution(event):
         await event.respond(f"❌ Erreur: {e}")
 
 async def cmd_canal_compteur2(event):
-    """Commande /canalcompteur2 - Gérer le canal de redirection Compteur2"""
     global COMPTEUR2_CHANNEL_ID
     
     if event.is_group or event.is_channel:
@@ -1457,7 +1795,7 @@ async def cmd_canal_compteur2(event):
                 await event.respond(
                     f"📊 **CANAL COMPTEUR2**\n\n"
                     f"✅ Actif: `{COMPTEUR2_CHANNEL_ID}`\n\n"
-                    f"**Usage:** `/canalcompteur2 [ID]` ou `/canalcompteur2 off`"
+                    f"**Usage:** `/canalcompteur2 ID]` ou `/canalcompteur2 off`"
                 )
             else:
                 await event.respond(
@@ -1497,7 +1835,6 @@ async def cmd_canal_compteur2(event):
         await event.respond(f"❌ Erreur: {e}")
 
 async def cmd_canaux(event):
-    """Commande /canaux - Voir tous les canaux configurés"""
     global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID, PREDICTION_CHANNEL_ID, SOURCE_CHANNEL_ID
     
     if event.is_group or event.is_channel:
@@ -1519,7 +1856,6 @@ async def cmd_canaux(event):
     await event.respond("\n".join(lines))
 
 async def cmd_queue(event):
-    """Commande /queue - Voir la file d'attente."""
     global prediction_queue, current_game_number, MIN_GAP_BETWEEN_PREDICTIONS, PREDICTION_SEND_AHEAD, pause_active
     
     if event.is_group or event.is_channel:
@@ -1570,7 +1906,7 @@ async def cmd_queue(event):
         await event.respond(f"❌ Erreur: {str(e)}")
 
 async def cmd_compteur2(event):
-    global compteur2_seuil_B, compteur2_active, compteur2_trackers
+    global compteur2_seuil_B, compteur2_active, compteur2_trackers, B_SPECIAL, blocked_suits_for_distribution
     
     if event.is_group or event.is_channel:
         return
@@ -1585,20 +1921,32 @@ async def cmd_compteur2(event):
             status_str = "✅ ON" if compteur2_active else "❌ OFF"
             
             lines = [
-                "📊 **COMPTEUR2**",
-                f"Statut: {status_str} | Seuil B: {compteur2_seuil_B}",
+                "📊 **COMPTEUR2** (Costumes manquants)",
+                f"Statut: {status_str} | B normal: {compteur2_seuil_B}",
+                f"B spécial (bloqués): {B_SPECIAL}",
                 "",
+                "Progression par costume:",
             ]
             
             for suit in ALL_SUITS:
                 tracker = compteur2_trackers.get(suit)
                 if tracker:
-                    progress = min(tracker.counter, compteur2_seuil_B)
-                    bar = f"[{'█' * progress}{'░' * (compteur2_seuil_B - progress)}]"
-                    status = "🔮 PRÊT" if tracker.counter >= compteur2_seuil_B else f"{tracker.counter}/{compteur2_seuil_B}"
-                    lines.append(f"{tracker.get_display_name()}: {bar} {status}")
+                    is_blocked = blocked_suits_for_distribution.get(suit, False)
+                    effective_B = B_SPECIAL if is_blocked else compteur2_seuil_B
+                    
+                    progress = min(tracker.counter, effective_B)
+                    bar = f"[{'█' * progress}{'░' * (effective_B - progress)}]"
+                    
+                    if tracker.counter >= effective_B:
+                        status = "🔮 PRÊT"
+                    else:
+                        status = f"{tracker.counter}/{effective_B}"
+                    
+                    block_indicator = "🔒" if is_blocked else ""
+                    lines.append(f"{tracker.get_display_name()} {block_indicator}: {bar} {status}")
             
-            lines.append(f"\n**Usage:** `/compteur2 [B/on/off/reset]`")
+            lines.append(f"\n🔒 = Bloqué pour #R (utilise B spécial)")
+            lines.append(f"**Usage:** `/compteur2 [B/on/off/reset]`")
             
             await event.respond("\n".join(lines))
             return
@@ -1622,7 +1970,7 @@ async def cmd_compteur2(event):
                     await event.respond("❌ B entre 2 et 10")
                     return
                 compteur2_seuil_B = b_val
-                await event.respond(f"✅ **Seuil B = {b_val}**")
+                await event.respond(f"✅ **Seuil B normal = {b_val}**\n(B spécial bloqués reste à {B_SPECIAL})")
             except ValueError:
                 await event.respond("❌ Usage: `/compteur2 [B/on/off/reset]`")
                 
@@ -1659,7 +2007,7 @@ async def cmd_history(event):
 
 async def cmd_status(event):
     global compteur2_active, compteur2_seuil_B, DISTRIBUTION_PLUS_VALUE
-    global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID, pause_active, pause_counter, PREDICTIONS_BEFORE_PAUSE, PAUSE_CYCLE
+    global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID, pause_active, pause_counter, PREDICTIONS_BEFORE_PAUSE, PAUSE_CYCLE, B_SPECIAL
     
     if event.is_group or event.is_channel:
         return
@@ -1670,11 +2018,16 @@ async def cmd_status(event):
     compteur2_str = "✅ ON" if compteur2_active else "❌ OFF"
     pause_str = "🟢 ACTIVE" if pause_active else "🔴 INACTIVE"
     
+    # Compter costumes bloqués
+    blocked_count = sum(1 for v in blocked_suits_for_distribution.values() if v)
+    
     lines = [
-        "📊 **STATUT**",
+        "📊 **STATUT COMPLET**",
         "",
         f"➕ Distribution: +{DISTRIBUTION_PLUS_VALUE}",
         f"📊 Compteur2: {compteur2_str} (B={compteur2_seuil_B})",
+        f"🔒 B spécial (bloqués): {B_SPECIAL}",
+        f"🚫 Costumes bloqués: {blocked_count}/4",
         f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}",
         f"⏸️ Pause: {pause_str} ({pause_counter}/{PREDICTIONS_BEFORE_PAUSE})",
         f"🔄 Cycle pause: {PAUSE_CYCLE}",
@@ -1691,12 +2044,20 @@ async def cmd_help(event):
     if event.is_group or event.is_channel:
         return
     
-    help_text = f"""📖 **BACCARAT AI**
+    help_text = f"""📖 **BACCARAT AI - COMMANDES**
 
-**⚙️ Config:**
+**⚙️ Configuration:**
 `/plus [1-20]` - Valeur #R (+{DISTRIBUTION_PLUS_VALUE})
 `/gap [2-10]` - Écart min ({MIN_GAP_BETWEEN_PREDICTIONS})
-`/compteur2 [B/on/off/reset]`
+
+**🔒 Blocage & Seuils:**
+`/block [1-4/off]` - Bloquer costume pour #R (1=♦️ 2=♠️ 3=♣️ 4=❤️)
+`/bspecial [2-10]` - B minimum pour costumes bloqués ({B_SPECIAL})
+`/compteur2 [B/on/off/reset]` - Gérer Compteur2 (B normal)
+
+**📊 Compteurs:**
+`/compteur1` - Voir Compteur1 (présences)
+`/stats` - Historique séries ≥3 (Compteur1)
 
 **📡 Canaux:**
 `/canaldistribution [ID/off]`
@@ -1708,7 +2069,7 @@ async def cmd_help(event):
 `/pausecycle [3,5,4]` - Modifier cycle
 `/pauseadd [texte]` - Ajouter expression
 
-**📊 Info:**
+**📋 Gestion:**
 `/queue` - File d'attente
 `/status` - Statut complet
 `/history` - Historique
@@ -1738,15 +2099,23 @@ def setup_handlers():
     client.add_event_handler(cmd_plus, events.NewMessage(pattern=r'^/plus'))
     client.add_event_handler(cmd_gap, events.NewMessage(pattern=r'^/gap'))
     
+    # NOUVEAU: Blocage et seuils
+    client.add_event_handler(cmd_block, events.NewMessage(pattern=r'^/block'))
+    client.add_event_handler(cmd_bspecial, events.NewMessage(pattern=r'^/bspecial'))
+    
     # Canaux
     client.add_event_handler(cmd_canal_distribution, events.NewMessage(pattern=r'^/canaldistribution'))
     client.add_event_handler(cmd_canal_compteur2, events.NewMessage(pattern=r'^/canalcompteur2'))
     client.add_event_handler(cmd_canaux, events.NewMessage(pattern=r'^/canaux$'))
     
-    # Pause (CORRIGÉ)
+    # Pause
     client.add_event_handler(cmd_pause, events.NewMessage(pattern=r'^/pause'))
     client.add_event_handler(cmd_pausecycle, events.NewMessage(pattern=r'^/pausecycle'))
     client.add_event_handler(cmd_pauseadd, events.NewMessage(pattern=r'^/pauseadd'))
+    
+    # NOUVEAU: Compteurs et stats
+    client.add_event_handler(cmd_compteur1, events.NewMessage(pattern=r'^/compteur1$'))
+    client.add_event_handler(cmd_stats, events.NewMessage(pattern=r'^/stats$'))
     
     # Gestion
     client.add_event_handler(cmd_queue, events.NewMessage(pattern=r'^/queue$'))
@@ -1792,7 +2161,6 @@ async def main():
         if not await start_bot():
             return
         
-        # CORRECTION: Démarrer la vérification périodique avec vérification de pause bloquée
         asyncio.create_task(auto_reset_system())
         
         app = web.Application()
@@ -1811,7 +2179,9 @@ async def main():
         logger.info(f"⏸️ Pause cycle: {PAUSE_CYCLE} min")
         logger.info(f"📡 Multi-canaux: ACTIVE")
         logger.info(f"🚫 #R+#X ignorés ensemble")
-        logger.info(f"✅ Système de pause corrigé - vérification auto toutes les 60s")
+        logger.info(f"🔒 Système de blocage costumes: ACTIVE")
+        logger.info(f"🎯 Compteur1 (présences): ACTIVE")
+        logger.info(f"✅ Système de pause corrigé")
         
         await client.run_until_disconnected()
         
