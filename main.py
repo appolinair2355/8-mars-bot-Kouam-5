@@ -351,8 +351,7 @@ async def pause_countdown_task(duration_min: int):
     
     total_seconds = duration_min * 60
     
-    # CORRECTION: Boucle de total_seconds down to 1 (pas 0)
-    # Et vérifier si la pause est toujours active
+    # CORRECTION: Boucle de total_seconds down to 1 (pas 0 ou -1)
     for i in range(total_seconds, 0, -1):
         if not pause_active:
             logger.info("⏸️ Pause annulée manuellement")
@@ -1767,7 +1766,7 @@ async def start_bot():
         setup_handlers()
         initialize_trackers()
         
-                if PREDICTION_CHANNEL_ID:
+        if PREDICTION_CHANNEL_ID:
             try:
                 pred_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
                 if pred_entity:
@@ -1824,4 +1823,3 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"Fatal: {e}")
         sys.exit(1)
-
