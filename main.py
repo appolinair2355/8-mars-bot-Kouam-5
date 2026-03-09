@@ -51,10 +51,10 @@ waiting_finalization: Dict[int, dict] = {}
 compteur2_trackers: Dict[str, 'Compteur2Tracker'] = {}
 compteur2_seuil_B = 2  # Seuil par défaut
 compteur2_active = True
-last_prediction_number = 0
-prediction_queue = []
-last_prediction_sent_time = None
-games_without_prediction = 0
+
+# Gestion des écarts entre prédictions
+MIN_GAP_BETWEEN_PREDICTIONS = 2  # Écart minimum entre 2 prédictions
+last_prediction_number_sent = 0  # Dernier numéro de prédiction envoyé
 
 # Historiques pour la commande /history
 finalized_messages_history: List[Dict] = []
@@ -165,6 +165,9 @@ def add_prediction_to_history(game_number: int, suit: str, verification_games: L
         'predicted_at': datetime.now(),
         'verification_games': verification_games,
         'status': 'en_cours',
+        'verified_at': None,
+        'verified_by_game': None,
+        'rattrapage_level': 0,
         'verified_by': [],
         'type': prediction_type
     })
@@ -173,7 +176,7 @@ def add_prediction_to_history(game_number: int, suit: str, verification_games: L
         prediction_history = prediction_history[:MAX_HISTORY_SIZE]
 
 def update_prediction_in_history(game_number: int, suit: str, verified_by_game: int, 
-                                verified_by_group: str, rattrapage_level: int, final_status: Optional[str] = None):
+                                verified_by_group: str, rattrapage_level: int, final_status: str):
     global finalized_messages_history, prediction_history
     
     for pred in prediction_history:
@@ -183,8 +186,10 @@ def update_prediction_in_history(game_number: int, suit: str, verified_by_game: 
                 'first_group': verified_by_group,
                 'rattrapage_level': rattrapage_level
             })
-            if final_status:
-                pred['status'] = final_status
+            pred['status'] = final_status
+            pred['verified_at'] = datetime.now()
+            pred['verified_by_game'] = verified_by_game
+            pred['rattrapage_level'] = rattrapage_level
             break
     
     for msg in finalized_messages_history:
@@ -238,68 +243,76 @@ def block_suit(suit: str, minutes: int = 5):
     logger.info(f"🔒 {suit} bloqué {minutes}min")
 
 # ============================================================================
-# GESTION DES PRÉDICTIONS
+# GESTION DES PRÉDICTIONS - MESSAGES JOLIS
 # ============================================================================
 
-async def can_send_prediction() -> bool:
-    global pending_predictions, last_prediction_sent_time
+def format_prediction_message(game_number: int, suit: str, prediction_type: str, status: str = 'en_cours', rattrapage: int = 0) -> str:
+    """Formate un message de prédiction joli."""
     
-    for pred in pending_predictions.values():
-        if pred['status'] == 'en_cours':
-            return False
+    suit_display = SUIT_DISPLAY.get(suit, suit)
+    type_emoji = {'distribution': '🎯', 'compteur2': '📊'}.get(prediction_type, '🤖')
+    type_name = {'distribution': 'DISTRIBUTION #R', 'compteur2': 'COMPTEUR2'}.get(prediction_type, 'PRÉDICTION')
     
-    if last_prediction_sent_time:
-        elapsed = datetime.now() - last_prediction_sent_time
-        if elapsed > timedelta(minutes=30):
-            logger.warning(f"⚠️ Prédiction en cours bloquée depuis {elapsed.total_seconds()/60:.1f}min")
+    if status == 'en_cours':
+        if rattrapage == 0:
+            status_line = "📊 Statut: En cours ⏳"
+            verif_line = f"🔍 Vérification: #{game_number} | #{game_number+1} | #{game_number+2}"
+        else:
+            status_line = f"📊 Statut: Rattrapage R{rattrapage} ⏳"
+            verif_line = f"🔍 Vérification: En attente #{game_number}"
+    elif status == 'gagne':
+        if rattrapage == 0:
+            status_line = "✅ Statut: GAGNÉ DIRECT 🎉"
+        else:
+            status_line = f"✅ Statut: GAGNÉ R{rattrapage} 🎉"
+        verif_line = ""
+    elif status == 'perdu':
+        status_line = "❌ Statut: PERDU 😭"
+        verif_line = ""
+    else:
+        status_line = f"📊 Statut: {status}"
+        verif_line = ""
     
-    return True
+    header_emoji = "🎰" if status == 'en_cours' else "🏆" if 'gagne' in status else "💔"
+    
+    lines = [
+        f"{header_emoji} **{type_name} #{game_number}**",
+        "",
+        f"🎯 **Couleur:** {suit_display}",
+        status_line,
+    ]
+    
+    if verif_line:
+        lines.append(verif_line)
+    
+    if status == 'en_cours':
+        lines.append("")
+        lines.append("⏳ *En attente du résultat...*")
+    
+    lines.append("")
+    lines.append("🤖 Baccarat AI")
+    
+    return "\n".join(lines)
 
-async def check_and_force_restart_if_needed():
-    global games_without_prediction
-    
-    if games_without_prediction >= 20:
-        logger.warning(f"🚨 BLOCAGE DÉTECTÉ: {games_without_prediction} numéros sans prédiction")
-        await perform_full_reset("🚨 Redémarrage forcé - Blocage détecté (>20 numéros)")
-        return True
-    
-    if current_game_number >= 1440:
-        logger.warning(f"🚨 RESET #1440 atteint")
-        await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint")
-        return True
-    
-    return False
-
-async def send_prediction(game_number: int, suit: str, prediction_type: str = 'standard', is_rattrapage: int = 0) -> Optional[int]:
-    global last_prediction_time, last_prediction_sent_time, last_prediction_number, games_without_prediction
+async def send_prediction(game_number: int, suit: str, prediction_type: str = 'standard') -> Optional[int]:
+    """Envoie une prédiction au canal configuré."""
+    global last_prediction_time, last_prediction_number_sent
     
     try:
+        # Vérifier si la couleur est bloquée
         if suit in suit_block_until and datetime.now() < suit_block_until[suit]:
             logger.info(f"🔒 {suit} bloqué, prédiction annulée")
             return None
         
-        if not await can_send_prediction():
-            logger.info(f"⏳ Prédiction en cours existante, mise en file d'attente: #{game_number} {suit}")
-            prediction_queue.append({
-                'game_number': game_number,
-                'suit': suit,
-                'type': prediction_type,
-                'added_at': datetime.now()
-            })
-            return None
-        
-        if last_source_game_number < game_number - 2:
-            logger.info(f"⏳ Attente approche numéro cible: {last_source_game_number}/{game_number - 2}")
-            prediction_queue.append({
-                'game_number': game_number,
-                'suit': suit,
-                'type': prediction_type,
-                'added_at': datetime.now()
-            })
-            return None
+        # Vérifier l'écart minimum
+        if last_prediction_number_sent > 0:
+            gap = game_number - last_prediction_number_sent
+            if gap < MIN_GAP_BETWEEN_PREDICTIONS:
+                logger.info(f"⏳ Écart insuffisant: {gap} < {MIN_GAP_BETWEEN_PREDICTIONS}. Attente...")
+                return None
         
         if not PREDICTION_CHANNEL_ID:
-            logger.error("❌ PREDICTION_CHANNEL_ID non configuré dans config.py!")
+            logger.error("❌ PREDICTION_CHANNEL_ID non configuré!")
             return None
         
         prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
@@ -307,38 +320,29 @@ async def send_prediction(game_number: int, suit: str, prediction_type: str = 's
             logger.error(f"❌ Impossible d'accéder au canal {PREDICTION_CHANNEL_ID}")
             return None
         
-        type_indicator = ""
-        if prediction_type == 'distribution':
-            type_indicator = " [#R]"
-        elif prediction_type == 'compteur2':
-            type_indicator = " [C2]"
-            
-        msg = f"""⏳BACCARAT AI 🤖⏳
-
-PLAYER : {game_number} {SUIT_DISPLAY.get(suit, suit)} : en cours....{type_indicator}"""
+        # Créer le message joli
+        msg = format_prediction_message(game_number, suit, prediction_type, 'en_cours', 0)
         
         try:
-            sent = await client.send_message(prediction_entity, msg)
+            sent = await client.send_message(prediction_entity, msg, parse_mode='markdown')
             last_prediction_time = datetime.now()
-            last_prediction_sent_time = datetime.now()
-            last_prediction_number = game_number
-            games_without_prediction = 0
+            last_prediction_number_sent = game_number
             
+            # Stockage de la prédiction avec infos de vérification
             pending_predictions[game_number] = {
                 'suit': suit,
                 'message_id': sent.id,
                 'status': 'en_cours',
-                'rattrapage': is_rattrapage,
-                'original_game': game_number if is_rattrapage == 0 else None,
-                'awaiting_rattrapage': 0,
+                'type': prediction_type,
                 'sent_time': datetime.now(),
-                'type': prediction_type
+                'verification_games': [game_number, game_number + 1, game_number + 2],
+                'verified_games': [],  # Jeux déjà vérifiés
+                'found_at': None,  # Où le costume a été trouvé
+                'rattrapage': 0
             }
             
-            if is_rattrapage == 0:
-                verification_games = [game_number, game_number + 1, game_number + 2]
-                add_prediction_to_history(game_number, suit, verification_games, prediction_type)
-                logger.info(f"📋 Prédiction #{game_number} {suit} ({prediction_type}): vérification sur {verification_games}")
+            # Historique
+            add_prediction_to_history(game_number, suit, [game_number, game_number + 1, game_number + 2], prediction_type)
             
             logger.info(f"✅ Prédiction envoyée: #{game_number} {suit} ({prediction_type})")
             return sent.id
@@ -351,78 +355,13 @@ PLAYER : {game_number} {SUIT_DISPLAY.get(suit, suit)} : en cours....{type_indica
             return None
             
     except Exception as e:
-        logger.error(f"❌ Erreur inattendue envoi prédiction: {e}")
+        logger.error(f"❌ Erreur envoi prédiction: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return None
 
-async def process_prediction_queue():
-    global prediction_queue
-    
-    if not prediction_queue:
-        return
-    
-    if not await can_send_prediction():
-        return
-    
-    if prediction_queue:
-        pred = prediction_queue[0]
-        if last_source_game_number >= pred['game_number'] - 2:
-            prediction_queue.pop(0)
-            await send_prediction(pred['game_number'], pred['suit'], pred['type'])
-        else:
-            if datetime.now() - pred['added_at'] > timedelta(minutes=5):
-                logger.warning(f"⚠️ Prédiction en file d'attente trop vieille, suppression: #{pred['game_number']}")
-                prediction_queue.pop(0)
-
-async def check_prediction_result(game_number: int, first_group: str) -> bool:
-    suits_in_result = get_suits_in_group(first_group)
-    
-    if game_number in pending_predictions:
-        pred = pending_predictions[game_number]
-        if pred.get('rattrapage', 0) == 0:
-            target_suit = pred['suit']
-            pred_type = pred.get('type', 'standard')
-            logger.info(f"🔍 Vérif #{game_number} original ({pred_type}): {target_suit} dans {suits_in_result}")
-            
-            if target_suit in suits_in_result:
-                await update_prediction_message(game_number, '✅0️⃣', True)
-                update_prediction_in_history(game_number, target_suit, game_number, first_group, 0, 'gagne_r0')
-                await process_prediction_queue()
-                return True
-            else:
-                pred['awaiting_rattrapage'] = 1
-                logger.info(f"❌ #{game_number} échoué, attente rattrapage #{game_number + 1}")
-                return False
-    
-    for original_game, pred in list(pending_predictions.items()):
-        awaiting = pred.get('awaiting_rattrapage', 0)
-        if awaiting > 0 and game_number == original_game + awaiting:
-            target_suit = pred['suit']
-            logger.info(f"🔍 Vérif rattrapage R{awaiting} #{game_number}: {target_suit}")
-            
-            if target_suit in suits_in_result:
-                status = f'✅{awaiting}️⃣'
-                await update_prediction_message(original_game, status, True, awaiting)
-                final_status = f'gagne_r{awaiting}'
-                update_prediction_in_history(original_game, target_suit, game_number, first_group, awaiting, final_status)
-                await process_prediction_queue()
-                return True
-            else:
-                if awaiting < 2:
-                    pred['awaiting_rattrapage'] = awaiting + 1
-                    logger.info(f"❌ R{awaiting} échoué, attente #{original_game + awaiting + 1}")
-                    return False
-                else:
-                    logger.info(f"❌ R2 échoué, prédiction perdue")
-                    await update_prediction_message(original_game, '❌', False)
-                    update_prediction_in_history(original_game, target_suit, game_number, first_group, 2, 'perdu')
-                    await process_prediction_queue()
-                    return False
-    
-    return False
-
-async def update_prediction_message(game_number: int, status: str, trouve: bool, rattrapage: int = 0):
+async def update_prediction_message(game_number: int, status: str, rattrapage: int = 0):
+    """Met à jour le statut d'une prédiction avec message joli."""
     if game_number not in pending_predictions:
         return
     
@@ -431,24 +370,8 @@ async def update_prediction_message(game_number: int, status: str, trouve: bool,
     msg_id = pred['message_id']
     pred_type = pred.get('type', 'standard')
     
-    type_indicator = ""
-    if pred_type == 'distribution':
-        type_indicator = " [#R]"
-    elif pred_type == 'compteur2':
-        type_indicator = " [C2]"
-    
-    if status == '✅0️⃣':
-        result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ✅0️⃣ GAGNÉ{type_indicator}"
-    elif status == '✅1️⃣':
-        result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ✅1️⃣ GAGNÉ{type_indicator}"
-    elif status == '✅2️⃣':
-        result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ✅2️⃣ GAGNÉ{type_indicator}"
-    else:
-        result_line = f"{SUIT_DISPLAY.get(suit, suit)} : ❌ PERDU 😭{type_indicator}"
-    
-    new_msg = f"""⏳BACCARAT AI 🤖⏳
-
-PLAYER : {game_number} {result_line}"""
+    # Créer le message mis à jour
+    new_msg = format_prediction_message(game_number, suit, pred_type, status, rattrapage)
     
     try:
         prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
@@ -456,11 +379,11 @@ PLAYER : {game_number} {result_line}"""
             logger.error("❌ Canal de prédiction non accessible pour mise à jour")
             return
             
-        await client.edit_message(prediction_entity, msg_id, new_msg)
+        await client.edit_message(prediction_entity, msg_id, new_msg, parse_mode='markdown')
         pred['status'] = status
         
-        if trouve:
-            logger.info(f"✅ Gagné: #{game_number} {status}")
+        if 'gagne' in status:
+            logger.info(f"✅ Gagné: #{game_number} (R{rattrapage})")
         else:
             logger.info(f"❌ Perdu: #{game_number}")
             block_suit(suit, 5)
@@ -469,6 +392,127 @@ PLAYER : {game_number} {result_line}"""
         
     except Exception as e:
         logger.error(f"❌ Erreur update message: {e}")
+
+async def check_prediction_result(game_number: int, first_group: str) -> bool:
+    """
+    Vérifie dynamiquement si une prédiction est gagnante.
+    Met à jour le message à chaque vérification.
+    """
+    suits_in_result = get_suits_in_group(first_group)
+    
+    # Vérifier si ce numéro correspond à une prédiction en cours
+    if game_number in pending_predictions:
+        pred = pending_predictions[game_number]
+        if pred['status'] != 'en_cours':
+            return False
+            
+        target_suit = pred['suit']
+        pred_type = pred.get('type', 'standard')
+        
+        # Vérifier si déjà vérifié ce jeu
+        if game_number in pred['verified_games']:
+            return False
+        
+        pred['verified_games'].append(game_number)
+        
+        logger.info(f"🔍 Vérification #{game_number}: {target_suit} dans {suits_in_result}?")
+        
+        if target_suit in suits_in_result:
+            # GAGNÉ DIRECT (R0)
+            await update_prediction_message(game_number, 'gagne', 0)
+            update_prediction_in_history(game_number, target_suit, game_number, first_group, 0, 'gagne_r0')
+            return True
+        else:
+            # Pas trouvé, passer au suivant
+            pred['rattrapage'] = 1
+            logger.info(f"❌ #{game_number} non trouvé, attente #{game_number + 1}")
+            # Mettre à jour le message pour montrer la progression
+            await update_prediction_progress(game_number, 1)
+            return False
+    
+    # Vérifier les rattrapages (R1, R2)
+    for original_game, pred in list(pending_predictions.items()):
+        if pred['status'] != 'en_cours':
+            continue
+            
+        target_suit = pred['suit']
+        rattrapage = pred.get('rattrapage', 0)
+        
+        # Vérifier si ce numéro correspond au rattrapage attendu
+        expected_game = original_game + rattrapage
+        
+        if game_number == expected_game and rattrapage > 0:
+            # Vérifier si déjà vérifié
+            if game_number in pred['verified_games']:
+                return False
+            
+            pred['verified_games'].append(game_number)
+            
+            logger.info(f"🔍 Vérification R{rattrapage} #{game_number}: {target_suit} dans {suits_in_result}?")
+            
+            if target_suit in suits_in_result:
+                # GAGNÉ R1 ou R2
+                await update_prediction_message(original_game, 'gagne', rattrapage)
+                update_prediction_in_history(original_game, target_suit, game_number, first_group, rattrapage, f'gagne_r{rattrapage}')
+                return True
+            else:
+                # Pas trouvé, passer au suivant ou perdre
+                if rattrapage < 2:
+                    pred['rattrapage'] = rattrapage + 1
+                    logger.info(f"❌ R{rattrapage} échoué, attente #{original_game + rattrapage + 1}")
+                    # Mettre à jour le message pour montrer la progression
+                    await update_prediction_progress(original_game, rattrapage + 1)
+                    return False
+                else:
+                    # R2 échoué = PERDU
+                    logger.info(f"❌ R2 échoué, prédiction perdue")
+                    await update_prediction_message(original_game, 'perdu', 2)
+                    update_prediction_in_history(original_game, target_suit, game_number, first_group, 2, 'perdu')
+                    return False
+    
+    return False
+
+async def update_prediction_progress(game_number: int, current_rattrapage: int):
+    """Met à jour l'affichage de la progression de la vérification."""
+    if game_number not in pending_predictions:
+        return
+    
+    pred = pending_predictions[game_number]
+    suit = pred['suit']
+    msg_id = pred['message_id']
+    pred_type = pred.get('type', 'standard')
+    suit_display = SUIT_DISPLAY.get(suit, suit)
+    type_name = {'distribution': 'DISTRIBUTION #R', 'compteur2': 'COMPTEUR2'}.get(pred_type, 'PRÉDICTION')
+    
+    # Construire les lignes de vérification
+    verif_lines = []
+    original = game_number
+    for i in range(3):
+        check_num = original + i
+        if i < current_rattrapage:
+            status = "❌"
+        elif i == current_rattrapage:
+            status = "⏳"
+        else:
+            status = "⏸️"
+        verif_lines.append(f"{status} #{check_num}")
+    
+    msg = f"""🎰 **{type_name} #{game_number}**
+
+🎯 **Couleur:** {suit_display}
+📊 Statut: En cours ⏳
+🔍 Vérification: {' | '.join(verif_lines)}
+
+⏳ *En attente du résultat...*
+
+🤖 Baccarat AI"""
+    
+    try:
+        prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+        if prediction_entity:
+            await client.edit_message(prediction_entity, msg_id, msg, parse_mode='markdown')
+    except Exception as e:
+        logger.error(f"❌ Erreur update progress: {e}")
 
 # ============================================================================
 # GESTION #R ET COMPTEUR2
@@ -501,7 +545,7 @@ def check_distribution_rule(game_number: int, message_text: str) -> Optional[tup
     if len(missing_suits) == 1:
         missing_suit = list(missing_suits)[0]
         prediction_number = game_number + 5
-        logger.info(f"🎯 #R DÉTECTÉ: {missing_suit} manquant dans groupes '{first_group}' et '{second_group}' → Prédiction #{prediction_number}")
+        logger.info(f"🎯 #R DÉTECTÉ: {missing_suit} manquant → Prédiction #{prediction_number}")
         return (missing_suit, prediction_number)
     
     return None
@@ -537,13 +581,16 @@ def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
 # ============================================================================
 
 async def process_game_result(game_number: int, message_text: str):
-    global current_game_number, last_source_game_number, games_without_prediction
+    global current_game_number, last_source_game_number
     
     current_game_number = game_number
     last_source_game_number = game_number
-    games_without_prediction += 1
     
-    await check_and_force_restart_if_needed()
+    # Vérification auto-reset
+    if current_game_number >= 1440:
+        logger.warning(f"🚨 RESET #1440 atteint")
+        await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint")
+        return
     
     groups = extract_parentheses_groups(message_text)
     if not groups:
@@ -557,23 +604,28 @@ async def process_game_result(game_number: int, message_text: str):
     
     add_to_history(game_number, message_text, first_group, suits_in_first)
     
-    if await check_prediction_result(game_number, first_group):
+    # Vérification des prédictions existantes (dynamique)
+    await check_prediction_result(game_number, first_group)
+    
+    # NOUVEAU: Vérifier s'il y a des prédictions en cours avant d'en créer de nouvelles
+    if pending_predictions:
+        logger.info(f"⏳ Prédiction(s) en cours, pas de nouvelle prédiction pour l'instant")
         return
     
+    # Distribution #R
     distribution_result = check_distribution_rule(game_number, message_text)
     if distribution_result:
         suit, pred_num = distribution_result
-        if pred_num not in pending_predictions:
-            await send_prediction(pred_num, suit, 'distribution')
-            return
+        await send_prediction(pred_num, suit, 'distribution')
+        return
     
+    # Compteur2
     if compteur2_active:
         update_compteur2(game_number, first_group)
         
         compteur2_preds = get_compteur2_ready_predictions(game_number)
         for suit, pred_num in compteur2_preds:
-            if pred_num not in pending_predictions:
-                await send_prediction(pred_num, suit, 'compteur2')
+            await send_prediction(pred_num, suit, 'compteur2')
 
 async def handle_message(event, is_edit: bool = False):
     try:
@@ -593,7 +645,7 @@ async def handle_message(event, is_edit: bool = False):
         logger.info(f"📨{edit_info} Msg {event.message.id}: {message_text[:60]}...")
         
         if is_message_being_edited(message_text):
-            logger.info(f"⏳ Message en cours d'édition (⏰), ignoré pour l'instant")
+            logger.info(f"⏳ Message en cours d'édition (⏰), ignoré")
             if '⏰' in message_text:
                 match = re.search(r"#N\s*(\d+)", message_text, re.IGNORECASE)
                 if match:
@@ -655,8 +707,6 @@ async def auto_reset_system():
                     logger.info(f"⏰ Reset inactivité ({elapsed.total_seconds()/3600:.1f}h)")
                     await perform_full_reset("⏰ Reset inactivité 1h")
             
-            await process_prediction_queue()
-            
             await asyncio.sleep(30)
             
         except Exception as e:
@@ -664,9 +714,8 @@ async def auto_reset_system():
             await asyncio.sleep(60)
 
 async def perform_full_reset(reason: str):
-    global pending_predictions, last_prediction_time, waiting_finalization, prediction_queue
-    global games_without_prediction, last_prediction_number, last_prediction_sent_time
-    global compteur2_trackers
+    global pending_predictions, last_prediction_time, waiting_finalization
+    global last_prediction_number_sent, compteur2_trackers
     
     stats = len(pending_predictions)
     
@@ -676,11 +725,8 @@ async def perform_full_reset(reason: str):
     
     pending_predictions.clear()
     waiting_finalization.clear()
-    prediction_queue.clear()
     last_prediction_time = None
-    last_prediction_sent_time = None
-    last_prediction_number = 0
-    games_without_prediction = 0
+    last_prediction_number_sent = 0
     suit_block_until.clear()
     
     logger.info(f"🔄 {reason} - {stats} prédictions cleared, Compteur2 reset")
@@ -696,10 +742,9 @@ async def perform_full_reset(reason: str):
 
 ✅ Compteurs Compteur2 remis à zéro
 ✅ {stats} prédictions cleared
-✅ File d'attente vidée
 ✅ Nouvelle analyse
 
-⏳BACCARAT AI 🤖⏳"""
+🤖 Baccarat AI"""
             )
     except Exception as e:
         logger.error(f"❌ Notif reset failed: {e}")
@@ -707,6 +752,58 @@ async def perform_full_reset(reason: str):
 # ============================================================================
 # COMMANDES ADMIN
 # ============================================================================
+
+async def cmd_gap(event):
+    """Commande /gap - Configure l'écart minimum entre prédictions."""
+    global MIN_GAP_BETWEEN_PREDICTIONS
+    
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    
+    try:
+        parts = event.message.message.split()
+        
+        if len(parts) == 1:
+            # Afficher le statut actuel
+            await event.respond(
+                f"📏 **CONFIGURATION DES ÉCARTS**\n\n"
+                f"Écart minimum actuel: **{MIN_GAP_BETWEEN_PREDICTIONS}** numéros\n\n"
+                f"💡 Règle: Une prédiction ne peut être lancée que si l'écart "
+                f"avec la dernière prédiction est d'au moins {MIN_GAP_BETWEEN_PREDICTIONS} numéros.\n\n"
+                f"**Usage:**\n"
+                f"`/gap [2-10]` - Définir l'écart minimum\n"
+                f"Exemple: `/gap 3` pour 3 numéros d'écart minimum"
+            )
+            return
+        
+        arg = parts[1].lower()
+        
+        try:
+            gap_val = int(arg)
+            if not 2 <= gap_val <= 10:
+                await event.respond("❌ L'écart doit être entre 2 et 10")
+                return
+            
+            old_gap = MIN_GAP_BETWEEN_PREDICTIONS
+            MIN_GAP_BETWEEN_PREDICTIONS = gap_val
+            
+            await event.respond(
+                f"✅ **Écart modifié**\n\n"
+                f"Ancien: {old_gap} numéros\n"
+                f"Nouveau: **{gap_val}** numéros\n\n"
+                f"💡 Les prochaines prédictions respecteront cet écart minimum."
+            )
+            logger.info(f"Admin change écart: {old_gap} → {gap_val}")
+            
+        except ValueError:
+            await event.respond("❌ Usage: `/gap [2-10]`")
+            
+    except Exception as e:
+        logger.error(f"Erreur cmd_gap: {e}")
+        await event.respond(f"❌ Erreur: {e}")
 
 async def cmd_compteur2(event):
     global compteur2_seuil_B, compteur2_active, compteur2_trackers
@@ -727,10 +824,10 @@ async def cmd_compteur2(event):
                 "📊 **COMPTEUR2 - STATUT**",
                 f"Statut: {status_str}",
                 f"🎯 Seuil B (prédiction): {compteur2_seuil_B}",
-                f"🎮 Dernier jeu analysé: #{current_game_number}",
+                f"📏 Écart minimum: {MIN_GAP_BETWEEN_PREDICTIONS} numéros",
+                f"🎮 Dernier jeu: #{current_game_number}",
                 f"📋 Prédictions actives: {len(pending_predictions)}",
-                f"⏳ File d'attente: {len(prediction_queue)}",
-                f"🚫 Sans prédiction: {games_without_prediction}/20",
+                f"🎯 Dernière prédiction: #{last_prediction_number_sent if last_prediction_number_sent else 'Aucune'}",
                 "",
                 "📈 **Compteurs actuels:**"
             ]
@@ -824,97 +921,51 @@ async def cmd_history(event):
         return
     
     lines = [
-        "📜 **HISTORIQUE DES 5 DERNIERS MESSAGES FINALISÉS**",
+        "📜 **HISTORIQUE DES PRÉDICTIONS**",
         "═══════════════════════════════════════",
         ""
     ]
     
-    recent_messages = finalized_messages_history[:5]
-    
-    if not recent_messages:
-        lines.append("❌ Aucun message dans l'historique")
-    else:
-        for i, msg in enumerate(recent_messages, 1):
-            time_str = msg['timestamp'].strftime('%H:%M:%S')
-            game_num = msg['game_number']
-            group = msg['first_group']
-            suits = ', '.join([SUIT_DISPLAY.get(s, s) for s in msg['suits_found']]) if msg['suits_found'] else 'Aucune'
-            
-            verif_indicator = ""
-            if msg['predictions_verified']:
-                verif_details = []
-                for v in msg['predictions_verified']:
-                    suit_display = SUIT_DISPLAY.get(v['suit'], v['suit'])
-                    if v['rattrapage_level'] == 0:
-                        verif_details.append(f"✅0️⃣ #{v['predicted_game']}{suit_display}")
-                    elif v['rattrapage_level'] == 1:
-                        verif_details.append(f"✅1️⃣ #{v['predicted_game']}{suit_display}")
-                    elif v['rattrapage_level'] == 2:
-                        verif_details.append(f"✅2️⃣ #{v['predicted_game']}{suit_display}")
-                verif_indicator = "\n   🔍 Vérification: " + " | ".join(verif_details)
-            
-            lines.append(
-                f"{i}. 🕐 `{time_str}` | **Jeu #{game_num}**\n"
-                f"   📝 `{group}`\n"
-                f"   🎨 Couleurs: {suits}{verif_indicator}"
-            )
-            lines.append("")
-    
-    lines.append("🔮 **PRÉDICTIONS RÉCENTES**")
-    lines.append("───────────────────────────────────────")
-    
-    recent_predictions = prediction_history[:5]
+    recent_predictions = prediction_history[:10]
     
     if not recent_predictions:
         lines.append("❌ Aucune prédiction dans l'historique")
     else:
-        for pred in recent_predictions:
+        for i, pred in enumerate(recent_predictions, 1):
             pred_game = pred['predicted_game']
             suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
             status = pred['status']
             pred_time = pred['predicted_at'].strftime('%H:%M:%S')
             pred_type = pred.get('type', 'standard')
             
-            type_emoji = {'distribution': '#️⃣', 'compteur2': '2️⃣'}.get(pred_type, '❓')
+            type_emoji = {'distribution': '🎯', 'compteur2': '📊'}.get(pred_type, '❓')
             
             if status == 'en_cours':
                 status_str = "⏳ En cours..."
+                result_emoji = "🎰"
             elif status == 'gagne_r0':
-                status_str = "✅0️⃣ GAGNÉ direct"
+                status_str = "✅ GAGNÉ DIRECT"
+                result_emoji = "🏆"
             elif status == 'gagne_r1':
-                status_str = "✅1️⃣ GAGNÉ R1"
+                status_str = "✅ GAGNÉ R1"
+                result_emoji = "🏆"
             elif status == 'gagne_r2':
-                status_str = "✅2️⃣ GAGNÉ R2"
+                status_str = "✅ GAGNÉ R2"
+                result_emoji = "🏆"
             elif status == 'perdu':
                 status_str = "❌ PERDU"
+                result_emoji = "💔"
             else:
                 status_str = f"❓ {status}"
+                result_emoji = "❓"
             
-            lines.append(f"{type_emoji} **#{pred_game}** {suit} | {status_str}")
-            lines.append(f"   🕐 Prédit à: {pred_time}")
+            lines.append(f"{i}. {result_emoji} **#{pred_game}** {suit} | {type_emoji} {status_str}")
+            lines.append(f"   🕐 {pred_time}")
             
-            if pred['verified_by']:
-                lines.append("   📋 Vérifié par:")
-                for v in pred['verified_by']:
-                    r_text = f"R{v['rattrapage_level']}" if v['rattrapage_level'] > 0 else "Direct"
-                    lines.append(f"      • Jeu #{v['game_number']} ({r_text}): `{v['first_group']}`")
-            else:
-                verif_games = pred['verification_games']
-                if status == 'en_cours':
-                    pending_games = [g for g in verif_games if g > current_game_number]
-                    checked_games = [g for g in verif_games if g <= current_game_number]
-                    
-                    if checked_games:
-                        lines.append(f"   ✅ Déjà vérifié: {', '.join(['#' + str(g) for g in checked_games])}")
-                    if pending_games:
-                        lines.append(f"   ⏳ En attente: {', '.join(['#' + str(g) for g in pending_games])}")
+            if pred.get('verified_by_game'):
+                lines.append(f"   ✅ Vérifié au jeu #{pred['verified_by_game']}")
             
             lines.append("")
-    
-    lines.append("═══════════════════════════════════════")
-    lines.append("💡 **Légende:**")
-    lines.append("• #️⃣ = Distribution (#R)")
-    lines.append("• 2️⃣ = Compteur2")
     
     await event.respond("\n".join(lines))
 
@@ -929,16 +980,37 @@ async def cmd_status(event):
     
     compteur2_str = "✅ ON" if compteur2_active else "❌ OFF"
     
+    # Info prédictions actives
+    active_info = []
+    for num, pred in sorted(pending_predictions.items()):
+        suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
+        rattrapage = pred.get('rattrapage', 0)
+        verified = len(pred.get('verified_games', []))
+        
+        if rattrapage == 0 and verified == 0:
+            status = "⏳ Attente vérification"
+        elif rattrapage > 0:
+            status = f"⏳ Rattrapage R{rattrapage}"
+        else:
+            status = f" {verified}/3 vérifiés"
+        
+        active_info.append(f"• #{num} {suit}: {status}")
+    
     lines = [
         "📊 **STATUT DU SYSTÈME**",
         "",
-        f"Mode Compteur2: {compteur2_str} (seuil B={compteur2_seuil_B})",
+        f"📏 Écart minimum: **{MIN_GAP_BETWEEN_PREDICTIONS}** numéros",
+        f"📊 Compteur2: {compteur2_str} (seuil B={compteur2_seuil_B})",
         f"🎮 Dernier jeu: #{current_game_number}",
+        f"🎯 Dernière prédiction: #{last_prediction_number_sent if last_prediction_number_sent else 'Aucune'}",
         f"📋 Prédictions actives: {len(pending_predictions)}",
-        f"⏳ File d'attente: {len(prediction_queue)}",
-        f"🚫 Sans prédiction: {games_without_prediction}/20",
         ""
     ]
+    
+    if active_info:
+        lines.append("**🔮 PRÉDICTIONS EN COURS:**")
+        lines.extend(active_info)
+        lines.append("")
     
     lines.append("📊 **COMPTEUR2**")
     lines.append("─────────────────────")
@@ -960,38 +1032,10 @@ async def cmd_status(event):
             lines.append(f"{tracker.get_display_name()}: {bar} {status}")
     
     lines.append("")
-    
-    if pending_predictions:
-        lines.append("**🔮 PRÉDICTIONS ACTIVES:**")
-        for num, pred in sorted(pending_predictions.items()):
-            suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
-            ar = pred.get('awaiting_rattrapage', 0)
-            ptype = pred.get('type', 'standard')
-            
-            type_emoji = {'distribution': '#️⃣', 'compteur2': '2️⃣'}.get(ptype, '❓')
-            
-            if ar > 0:
-                status_str = f"attente R{ar} (#{num + ar})"
-            else:
-                status_str = pred['status']
-            
-            lines.append(f"• #{num} {suit} {type_emoji}: {status_str}")
-        lines.append("")
-    
-    if prediction_queue:
-        lines.append("**📥 FILE D'ATTENTE:**")
-        for p in prediction_queue[:5]:
-            suit = SUIT_DISPLAY.get(p['suit'], p['suit'])
-            type_emoji = {'distribution': '#️⃣', 'compteur2': '2️⃣'}.get(p['type'], '❓')
-            lines.append(f"• {type_emoji} #{p['predict_at']} {suit}")
-        if len(prediction_queue) > 5:
-            lines.append(f"... et {len(prediction_queue) - 5} autres")
-        lines.append("")
-    
     lines.extend([
         "**Légende:**",
-        "✅=Trouvé ❌=Manqué ⏳=Attente 🔮=Prédiction",
-        "#️⃣=Distribution 2️⃣=Compteur2"
+        "✅=Trouvé ❌=Manqué ⏳=Attente 🔮=Prêt",
+        "🎯=Distribution #R 📊=Compteur2"
     ])
     
     await event.respond("\n".join(lines))
@@ -1015,25 +1059,26 @@ async def cmd_help(event):
 • Seuil B atteint → prédit N+2
 
 **📋 Règles de sécurité:**
-• Jamais 2 prédictions simultanées
-• Attente N-2 avant envoi
-• Auto-reset si >20 numéros sans prédiction
+• Écart minimum: **{MIN_GAP_BETWEEN_PREDICTIONS}** numéros entre prédictions
+• Vérification dynamique sur 3 numéros (prédit, +1, +2)
+• Auto-reset si blocage
 • Reset complet au #1440
 
 **🔧 Commandes Admin:**
 
 `/status` - Voir tous les compteurs
 `/compteur2 [B/on/off/reset]` - Gérer Compteur2
-`/history` - Historique messages et prédictions
+`/gap [2-10]` - Configurer l'écart minimum
+`/history` - Historique des prédictions
 `/reset` - Reset manuel complet
 `/help` - Cette aide
 
 **💡 Détails:**
 • ⏰ = Message en cours d'édition (ignoré)
 • ✅/🔰 = Message finalisé (traité)
-• Vérification: 3 numéros (prédit, +1, +2)
+• Messages de prédiction mis à jour en temps réel
 
-⏳BACCARAT AI 🤖⏳"""
+🤖 Baccarat AI"""
     
     await event.respond(help_text)
 
@@ -1049,6 +1094,7 @@ async def cmd_reset(event):
     await event.respond("✅ Reset effectué!")
 
 def setup_handlers():
+    client.add_event_handler(cmd_gap, events.NewMessage(pattern=r'^/gap'))
     client.add_event_handler(cmd_compteur2, events.NewMessage(pattern=r'^/compteur2'))
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
     client.add_event_handler(cmd_history, events.NewMessage(pattern=r'^/history$'))
@@ -1106,6 +1152,7 @@ async def main():
         await site.start()
         
         logger.info(f"🌐 Web server port {PORT}")
+        logger.info(f"📊 Écart minimum: {MIN_GAP_BETWEEN_PREDICTIONS} numéros")
         logger.info(f"📊 Compteur2: {'Actif B=' + str(compteur2_seuil_B) if compteur2_active else 'Inactif'}")
         
         await client.run_until_disconnected()
