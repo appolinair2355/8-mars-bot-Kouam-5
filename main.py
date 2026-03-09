@@ -61,10 +61,12 @@ finalized_messages_history: List[Dict] = []
 MAX_HISTORY_SIZE = 50
 prediction_history: List[Dict] = []
 
-# NOUVEAU: Prédictions en attente d'envoi (buffer)
-# On stocke les prédictions détectées mais pas encore envoyées
-prediction_buffer: Dict[int, dict] = {}  # game_number -> prediction_info
+# NOUVEAU: File d'attente de prédictions (plusieurs prédictions possibles)
+prediction_queue: List[Dict] = []  # File ordonnée des prédictions en attente
 PREDICTION_SEND_AHEAD = 2  # Envoyer la prédiction quand canal source est à N-2
+
+# Valeur à ajouter pour la règle de distribution (configurable par admin)
+DISTRIBUTION_PLUS_VALUE = 5  # Valeur par défaut: +5
 
 # ============================================================================
 # FONCTION UTILITAIRE - Conversion ID Canal
@@ -174,7 +176,7 @@ def add_prediction_to_history(game_number: int, suit: str, verification_games: L
         'verified_by_game': None,
         'rattrapage_level': 0,
         'verified_by': [],
-        'type': prediction_type  # 'distribution', 'compteur2', ou 'standard'
+        'type': prediction_type
     })
     
     if len(prediction_history) > MAX_HISTORY_SIZE:
@@ -254,29 +256,19 @@ def block_suit(suit: str, minutes: int = 5):
 def format_prediction_message(game_number: int, suit: str, status: str = 'en_cours', 
                              current_check: int = None, verified_games: List[int] = None,
                              rattrapage: int = 0) -> str:
-    """
-    Formate un message de prédiction simplifié.
-    - current_check: numéro actuellement en vérification (pour le 🔵)
-    - verified_games: liste des jeux déjà vérifiés (on les efface, pas ❌)
-    """
     suit_display = SUIT_DISPLAY.get(suit, suit)
     
     if status == 'en_cours':
-        # Construction dynamique de la ligne de vérification
-        # On montre seulement les numéros non encore vérifiés, plus le current avec 🔵
         verif_parts = []
         
         for i in range(3):
             check_num = game_number + i
             
             if current_check == check_num:
-                # Numéro actuellement en vérification
                 verif_parts.append(f"🔵{check_num}")
             elif verified_games and check_num in verified_games:
-                # Déjà vérifié et pas trouvé → ON EFFACE (on ne met rien)
                 continue
             else:
-                # Pas encore vérifié
                 verif_parts.append(f"#{check_num}")
         
         verif_line = " | ".join(verif_parts)
@@ -315,13 +307,6 @@ async def send_prediction(game_number: int, suit: str, prediction_type: str = 's
             logger.info(f"🔒 {suit} bloqué, prédiction annulée")
             return None
         
-        # Vérifier l'écart minimum
-        if last_prediction_number_sent > 0:
-            gap = game_number - last_prediction_number_sent
-            if gap < MIN_GAP_BETWEEN_PREDICTIONS:
-                logger.info(f"⏳ Écart insuffisant: {gap} < {MIN_GAP_BETWEEN_PREDICTIONS}. Attente...")
-                return None
-        
         if not PREDICTION_CHANNEL_ID:
             logger.error("❌ PREDICTION_CHANNEL_ID non configuré!")
             return None
@@ -331,7 +316,6 @@ async def send_prediction(game_number: int, suit: str, prediction_type: str = 's
             logger.error(f"❌ Impossible d'accéder au canal {PREDICTION_CHANNEL_ID}")
             return None
         
-        # Créer le message simplifié
         msg = format_prediction_message(game_number, suit, 'en_cours', game_number, [])
         
         try:
@@ -339,7 +323,6 @@ async def send_prediction(game_number: int, suit: str, prediction_type: str = 's
             last_prediction_time = datetime.now()
             last_prediction_number_sent = game_number
             
-            # Stockage de la prédiction avec infos de vérification
             pending_predictions[game_number] = {
                 'suit': suit,
                 'message_id': sent.id,
@@ -347,13 +330,12 @@ async def send_prediction(game_number: int, suit: str, prediction_type: str = 's
                 'type': prediction_type,
                 'sent_time': datetime.now(),
                 'verification_games': [game_number, game_number + 1, game_number + 2],
-                'verified_games': [],  # Jeux déjà vérifiés
-                'found_at': None,  # Où le costume a été trouvé
+                'verified_games': [],
+                'found_at': None,
                 'rattrapage': 0,
-                'current_check': game_number  # Numéro actuellement en vérification
+                'current_check': game_number
             }
             
-            # Historique avec la règle utilisée
             add_prediction_to_history(game_number, suit, [game_number, game_number + 1, game_number + 2], prediction_type)
             
             logger.info(f"✅ Prédiction envoyée: #{game_number} {suit} (type: {prediction_type})")
@@ -381,7 +363,6 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
     suit = pred['suit']
     msg_id = pred['message_id']
     
-    # Créer le message mis à jour
     new_msg = format_prediction_message(game_number, suit, status, rattrapage=rattrapage)
     
     try:
@@ -414,10 +395,8 @@ async def update_prediction_progress(game_number: int, current_check: int):
     msg_id = pred['message_id']
     verified_games = pred.get('verified_games', [])
     
-    # Mettre à jour le current_check
     pred['current_check'] = current_check
     
-    # Reconstruire le message avec seulement les numéros restants
     msg = format_prediction_message(game_number, suit, 'en_cours', current_check, verified_games)
     
     try:
@@ -428,13 +407,8 @@ async def update_prediction_progress(game_number: int, current_check: int):
         logger.error(f"❌ Erreur update progress: {e}")
 
 async def check_prediction_result(game_number: int, first_group: str) -> bool:
-    """
-    Vérifie dynamiquement si une prédiction est gagnante.
-    Met à jour le message à chaque vérification avec 🔵 sur le numéro actuel.
-    """
     suits_in_result = get_suits_in_group(first_group)
     
-    # Vérifier si ce numéro correspond à une prédiction en cours
     if game_number in pending_predictions:
         pred = pending_predictions[game_number]
         if pred['status'] != 'en_cours':
@@ -442,7 +416,6 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
             
         target_suit = pred['suit']
         
-        # Vérifier si déjà vérifié ce jeu
         if game_number in pred['verified_games']:
             return False
         
@@ -451,32 +424,25 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
         logger.info(f"🔍 Vérification #{game_number}: {target_suit} dans {suits_in_result}?")
         
         if target_suit in suits_in_result:
-            # GAGNÉ DIRECT (R0)
             await update_prediction_message(game_number, 'gagne', 0)
             update_prediction_in_history(game_number, target_suit, game_number, first_group, 0, 'gagne_r0')
             return True
         else:
-            # Pas trouvé, passer au suivant
             pred['rattrapage'] = 1
             next_check = game_number + 1
             logger.info(f"❌ #{game_number} non trouvé, attente #{next_check}")
-            # Mettre à jour le message - le numéro 67 disparaît, on voit juste 🔵68 | #69
             await update_prediction_progress(game_number, next_check)
             return False
     
-    # Vérifier les rattrapages (R1, R2)
     for original_game, pred in list(pending_predictions.items()):
         if pred['status'] != 'en_cours':
             continue
             
         target_suit = pred['suit']
         rattrapage = pred.get('rattrapage', 0)
-        
-        # Vérifier si ce numéro correspond au rattrapage attendu
         expected_game = original_game + rattrapage
         
         if game_number == expected_game and rattrapage > 0:
-            # Vérifier si déjà vérifié
             if game_number in pred['verified_games']:
                 return False
             
@@ -485,21 +451,17 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
             logger.info(f"🔍 Vérification R{rattrapage} #{game_number}: {target_suit} dans {suits_in_result}?")
             
             if target_suit in suits_in_result:
-                # GAGNÉ R1 ou R2
                 await update_prediction_message(original_game, 'gagne', rattrapage)
                 update_prediction_in_history(original_game, target_suit, game_number, first_group, rattrapage, f'gagne_r{rattrapage}')
                 return True
             else:
-                # Pas trouvé, passer au suivant ou perdre
                 if rattrapage < 2:
                     pred['rattrapage'] = rattrapage + 1
                     next_check = original_game + rattrapage + 1
                     logger.info(f"❌ R{rattrapage} échoué, attente #{next_check}")
-                    # Mettre à jour le message - efface le numéro précédent
                     await update_prediction_progress(original_game, next_check)
                     return False
                 else:
-                    # R2 échoué = PERDU
                     logger.info(f"❌ R2 échoué, prédiction perdue")
                     await update_prediction_message(original_game, 'perdu', 2)
                     update_prediction_in_history(original_game, target_suit, game_number, first_group, 2, 'perdu')
@@ -520,7 +482,8 @@ def extract_first_two_groups(message: str) -> tuple:
     return "", ""
 
 def check_distribution_rule(game_number: int, message_text: str) -> Optional[tuple]:
-    """Vérifie la règle de distribution #R (interne)."""
+    global DISTRIBUTION_PLUS_VALUE
+    
     if '#R' not in message_text:
         return None
     
@@ -538,14 +501,13 @@ def check_distribution_rule(game_number: int, message_text: str) -> Optional[tup
     
     if len(missing_suits) == 1:
         missing_suit = list(missing_suits)[0]
-        prediction_number = game_number + 5
-        logger.info(f"🎯 #R DÉTECTÉ (interne): {missing_suit} manquant → Prédiction #{prediction_number}")
+        prediction_number = game_number + DISTRIBUTION_PLUS_VALUE
+        logger.info(f"🎯 #R DÉTECTÉ: {missing_suit} manquant → Prédiction #{prediction_number} (base #{game_number} + {DISTRIBUTION_PLUS_VALUE})")
         return (missing_suit, prediction_number)
     
     return None
 
 def update_compteur2(game_number: int, first_group: str):
-    """Met à jour le compteur2 (interne uniquement)."""
     global compteur2_trackers, compteur2_seuil_B
     
     suits_in_first = set(get_suits_in_group(first_group))
@@ -559,7 +521,6 @@ def update_compteur2(game_number: int, first_group: str):
             tracker.increment(game_number)
 
 def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
-    """Retourne les prédictions prêtes selon compteur2 (interne)."""
     global compteur2_trackers, compteur2_seuil_B
     
     ready = []
@@ -573,62 +534,116 @@ def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
     return ready
 
 # ============================================================================
-# NOUVEAU: GESTION DU BUFFER DE PRÉDICTIONS
+# NOUVEAU: GESTION INTELLIGENTE DE LA FILE D'ATTENTE
 # ============================================================================
 
-async def check_and_send_buffered_predictions(current_game: int):
+def can_accept_prediction(pred_number: int) -> bool:
     """
-    Vérifie si des prédictions dans le buffer doivent être envoyées.
-    Envoie la prédiction quand le canal source est à N-2 (ou plus proche).
+    Vérifie si une nouvelle prédiction peut être acceptée en vérifiant l'écart
+    avec toutes les prédictions existantes (file d'attente + en cours).
     """
-    global prediction_buffer
+    global prediction_queue, pending_predictions, last_prediction_number_sent, MIN_GAP_BETWEEN_PREDICTIONS
     
-    to_remove = []
+    # Vérifier écart avec la dernière prédiction envoyée
+    if last_prediction_number_sent > 0:
+        gap = pred_number - last_prediction_number_sent
+        if gap < MIN_GAP_BETWEEN_PREDICTIONS:
+            logger.info(f"⛔ Écart insuffisant avec dernier envoyé (#{last_prediction_number_sent}): {gap} < {MIN_GAP_BETWEEN_PREDICTIONS}")
+            return False
     
-    for pred_game, pred_info in list(prediction_buffer.items()):
-        # Calculer la distance
-        distance = pred_game - current_game
-        
-        # Envoyer si on est à 2 numéros ou moins avant la prédiction
-        if distance <= PREDICTION_SEND_AHEAD:
-            logger.info(f"📤 Envoi différé: prédiction #{pred_game} (canal à #{current_game}, distance={distance})")
-            
-            suit = pred_info['suit']
-            pred_type = pred_info['type']
-            
-            # Vérifier s'il y a déjà une prédiction en cours
-            if pending_predictions:
-                logger.info(f"⏳ Prédiction en cours, report de #{pred_game}")
-                continue
-            
-            # Envoyer la prédiction
-            msg_id = await send_prediction(pred_game, suit, pred_type)
-            
-            if msg_id:
-                to_remove.append(pred_game)
-            else:
-                logger.warning(f"⚠️ Échec envoi #{pred_game}, conservation dans buffer")
+    # Vérifier écart avec toutes les prédictions en cours de vérification
+    for existing_num in pending_predictions.keys():
+        gap = abs(pred_number - existing_num)
+        if gap < MIN_GAP_BETWEEN_PREDICTIONS:
+            logger.info(f"⛔ Écart insuffisant avec prédiction en cours (#{existing_num}): {gap} < {MIN_GAP_BETWEEN_PREDICTIONS}")
+            return False
     
-    # Nettoyer le buffer
-    for game in to_remove:
-        del prediction_buffer[game]
+    # Vérifier écart avec toutes les prédictions dans la file d'attente
+    for queued_pred in prediction_queue:
+        existing_num = queued_pred['game_number']
+        gap = abs(pred_number - existing_num)
+        if gap < MIN_GAP_BETWEEN_PREDICTIONS:
+            logger.info(f"⛔ Écart insuffisant avec file d'attente (#{existing_num}): {gap} < {MIN_GAP_BETWEEN_PREDICTIONS}")
+            return False
+    
+    return True
 
-async def add_to_prediction_buffer(game_number: int, suit: str, prediction_type: str):
-    """Ajoute une prédiction au buffer pour envoi différé."""
-    global prediction_buffer
+def add_to_prediction_queue(game_number: int, suit: str, prediction_type: str) -> bool:
+    """
+    Ajoute une prédiction à la file d'attente si l'écart est respecté.
+    La file est maintenue triée par numéro de prédiction.
+    """
+    global prediction_queue
     
-    # Vérifier si déjà dans le buffer
-    if game_number in prediction_buffer:
-        logger.info(f"⚠️ Prédiction #{game_number} déjà dans le buffer")
-        return
+    # Vérifier si déjà dans la file
+    for pred in prediction_queue:
+        if pred['game_number'] == game_number:
+            logger.info(f"⚠️ Prédiction #{game_number} déjà dans la file")
+            return False
     
-    prediction_buffer[game_number] = {
+    # Vérifier l'écart dynamique
+    if not can_accept_prediction(game_number):
+        logger.info(f"❌ Prédiction #{game_number} rejetée - écart insuffisant")
+        return False
+    
+    new_pred = {
+        'game_number': game_number,
         'suit': suit,
         'type': prediction_type,
         'added_at': datetime.now()
     }
     
-    logger.info(f"📥 Prédiction #{game_number} ({suit}) ajoutée au buffer (envoi à N-2)")
+    prediction_queue.append(new_pred)
+    # Trier par numéro de prédiction (ordre croissant)
+    prediction_queue.sort(key=lambda x: x['game_number'])
+    
+    logger.info(f"📥 Prédiction #{game_number} ({suit}) ajoutée à la file. Total: {len(prediction_queue)}")
+    return True
+
+async def process_prediction_queue(current_game: int):
+    """
+    Traite la file d'attente et envoie les prédictions dont c'est le moment.
+    Une prédiction est envoyée quand: canal >= pred_number - PREDICTION_SEND_AHEAD
+    ET qu'il n'y a pas de conflit avec les prédictions déjà envoyées.
+    """
+    global prediction_queue, pending_predictions
+    
+    to_remove = []
+    
+    for pred in prediction_queue:
+        pred_number = pred['game_number']
+        suit = pred['suit']
+        pred_type = pred['type']
+        
+        # Condition d'envoi: canal à N-2 ou plus proche
+        if current_game >= pred_number - PREDICTION_SEND_AHEAD:
+            # Vérifier qu'on n'a pas déjà une prédiction en cours qui bloque
+            if pending_predictions:
+                # Vérifier écart avec les prédictions actives
+                can_send = True
+                for active_num in pending_predictions.keys():
+                    gap = abs(pred_number - active_num)
+                    if gap < MIN_GAP_BETWEEN_PREDICTIONS:
+                        logger.info(f"⏳ Prédiction #{pred_number} attend - conflit avec active #{active_num}")
+                        can_send = False
+                        break
+                
+                if not can_send:
+                    continue
+            
+            # Envoyer la prédiction
+            logger.info(f"📤 Envoi depuis file: #{pred_number} (canal à #{current_game})")
+            msg_id = await send_prediction(pred_number, suit, pred_type)
+            
+            if msg_id:
+                to_remove.append(pred)
+            else:
+                logger.warning(f"⚠️ Échec envoi #{pred_number}, conservation dans file")
+    
+    # Nettoyer la file
+    for pred in to_remove:
+        prediction_queue.remove(pred)
+        logger.info(f"✅ #{pred['game_number']} retiré de la file. Restant: {len(prediction_queue)}")
 
 # ============================================================================
 # TRAITEMENT DES MESSAGES
@@ -640,7 +655,7 @@ async def process_game_result(game_number: int, message_text: str):
     current_game_number = game_number
     last_source_game_number = game_number
     
-    # Vérification auto-reset
+    # Vérification auto-reset uniquement au #1440
     if current_game_number >= 1440:
         logger.warning(f"🚨 RESET #1440 atteint")
         await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint")
@@ -658,33 +673,29 @@ async def process_game_result(game_number: int, message_text: str):
     
     add_to_history(game_number, message_text, first_group, suits_in_first)
     
-    # Vérification des prédictions existantes (dynamique avec 🔵)
+    # Vérification des prédictions existantes
     await check_prediction_result(game_number, first_group)
     
-    # NOUVEAU: Vérifier si des prédictions en buffer doivent être envoyées
-    await check_and_send_buffered_predictions(game_number)
+    # NOUVEAU: Traiter la file d'attente (envoi des prédictions prêtes)
+    await process_prediction_queue(game_number)
     
-    # Vérifier s'il y a des prédictions en cours avant d'en créer de nouvelles
-    if pending_predictions:
-        logger.info(f"⏳ Prédiction(s) en cours, pas de nouvelle prédiction pour l'instant")
-        return
-    
-    # Distribution #R (interne, ne s'affiche pas dans le message)
+    # Distribution #R - Ajouter à la file si écart OK
     distribution_result = check_distribution_rule(game_number, message_text)
     if distribution_result:
         suit, pred_num = distribution_result
-        # Ajouter au buffer au lieu d'envoyer immédiatement
-        await add_to_prediction_buffer(pred_num, suit, 'distribution')
-        return
+        added = add_to_prediction_queue(pred_num, suit, 'distribution')
+        if added:
+            logger.info(f"🎯 Distribution: #{pred_num} en file d'attente")
     
-    # Compteur2 (interne, ne s'affiche pas dans le message)
+    # Compteur2 - Ajouter à la file si écart OK
     if compteur2_active:
         update_compteur2(game_number, first_group)
         
         compteur2_preds = get_compteur2_ready_predictions(game_number)
         for suit, pred_num in compteur2_preds:
-            # Ajouter au buffer au lieu d'envoyer immédiatement
-            await add_to_prediction_buffer(pred_num, suit, 'compteur2')
+            added = add_to_prediction_queue(pred_num, suit, 'compteur2')
+            if added:
+                logger.info(f"📊 Compteur2: #{pred_num} en file d'attente")
 
 async def handle_message(event, is_edit: bool = False):
     try:
@@ -745,39 +756,50 @@ async def handle_edited_message(event):
     await handle_message(event, True)
 
 # ============================================================================
-# RESET AUTOMATIQUE
+# RESET ET NOTIFICATIONS
 # ============================================================================
 
-async def auto_reset_system():
-    global last_prediction_time
+async def notify_admin_reset(reason: str, stats: int, queue_stats: int):
+    """Envoie une notification de reset à l'admin en privé."""
+    if not ADMIN_ID or ADMIN_ID == 0:
+        logger.warning("⚠️ ADMIN_ID non configuré, impossible de notifier")
+        return
     
+    try:
+        admin_entity = await client.get_entity(ADMIN_ID)
+        
+        msg = f"""🔄 **RESET SYSTÈME**
+
+{reason}
+
+✅ Compteurs internes remis à zéro
+✅ {stats} prédictions actives cleared
+✅ {queue_stats} prédictions en file cleared
+✅ Nouvelle analyse
+
+🤖 Baccarat AI"""
+        
+        await client.send_message(admin_entity, msg, parse_mode='markdown')
+        logger.info(f"✅ Notification reset envoyée à l'admin {ADMIN_ID}")
+        
+    except Exception as e:
+        logger.error(f"❌ Impossible de notifier l'admin: {e}")
+
+async def auto_reset_system():
+    """Mode veille - plus de reset à 1h00."""
     while True:
         try:
-            now = datetime.now()
-            
-            if now.hour == 1 and now.minute == 0:
-                logger.info("🕐 Reset 1h00")
-                await perform_full_reset("🕐 Reset automatique 1h00")
-                await asyncio.sleep(60)
-            
-            if last_prediction_time:
-                elapsed = now - last_prediction_time
-                if elapsed > timedelta(hours=1) and pending_predictions:
-                    logger.info(f"⏰ Reset inactivité ({elapsed.total_seconds()/3600:.1f}h)")
-                    await perform_full_reset("⏰ Reset inactivité 1h")
-            
-            await asyncio.sleep(30)
-            
+            await asyncio.sleep(3600)
         except Exception as e:
             logger.error(f"❌ Erreur auto_reset: {e}")
             await asyncio.sleep(60)
 
 async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time, waiting_finalization
-    global last_prediction_number_sent, compteur2_trackers, prediction_buffer
+    global last_prediction_number_sent, compteur2_trackers, prediction_queue
     
     stats = len(pending_predictions)
-    buffer_stats = len(prediction_buffer)
+    queue_stats = len(prediction_queue)
     
     for tracker in compteur2_trackers.values():
         tracker.counter = 0
@@ -785,38 +807,66 @@ async def perform_full_reset(reason: str):
     
     pending_predictions.clear()
     waiting_finalization.clear()
-    prediction_buffer.clear()
+    prediction_queue.clear()
     last_prediction_time = None
     last_prediction_number_sent = 0
     suit_block_until.clear()
     
-    logger.info(f"🔄 {reason} - {stats} prédictions actives cleared, {buffer_stats} en buffer cleared, Compteur2 reset")
+    logger.info(f"🔄 {reason} - {stats} actives cleared, {queue_stats} file cleared, Compteur2 reset")
     
-    try:
-        prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if prediction_entity and client and client.is_connected():
-            await client.send_message(
-                prediction_entity,
-                f"""🔄 **RESET SYSTÈME**
-
-{reason}
-
-✅ Compteurs internes remis à zéro
-✅ {stats} prédictions actives cleared
-✅ {buffer_stats} prédictions en buffer cleared
-✅ Nouvelle analyse
-
-🤖 Baccarat AI"""
-            )
-    except Exception as e:
-        logger.error(f"❌ Notif reset failed: {e}")
+    await notify_admin_reset(reason, stats, queue_stats)
 
 # ============================================================================
 # COMMANDES ADMIN
 # ============================================================================
 
+async def cmd_plus(event):
+    global DISTRIBUTION_PLUS_VALUE
+    
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    
+    try:
+        parts = event.message.message.split()
+        
+        if len(parts) == 1:
+            await event.respond(
+                f"➕ **CONFIGURATION DISTRIBUTION #R**\n\n"
+                f"Valeur actuelle: **+{DISTRIBUTION_PLUS_VALUE}**\n\n"
+                f"💡 Règle: Quand #R détecté au jeu #N, prédiction à #N+{DISTRIBUTION_PLUS_VALUE}\n\n"
+                f"**Usage:** `/plus [1-20]`"
+            )
+            return
+        
+        arg = parts[1]
+        
+        try:
+            plus_val = int(arg)
+            if not 1 <= plus_val <= 20:
+                await event.respond("❌ La valeur doit être entre 1 et 20")
+                return
+            
+            old_val = DISTRIBUTION_PLUS_VALUE
+            DISTRIBUTION_PLUS_VALUE = plus_val
+            
+            await event.respond(
+                f"✅ **Valeur modifiée**\n\n"
+                f"Ancienne: +{old_val}\n"
+                f"Nouvelle: **+{plus_val}**"
+            )
+            logger.info(f"Admin change valeur distribution: +{old_val} → +{plus_val}")
+            
+        except ValueError:
+            await event.respond("❌ Usage: `/plus [1-20]`")
+            
+    except Exception as e:
+        logger.error(f"Erreur cmd_plus: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
 async def cmd_gap(event):
-    """Commande /gap - Configure l'écart minimum entre prédictions."""
     global MIN_GAP_BETWEEN_PREDICTIONS
     
     if event.is_group or event.is_channel:
@@ -829,15 +879,11 @@ async def cmd_gap(event):
         parts = event.message.message.split()
         
         if len(parts) == 1:
-            # Afficher le statut actuel
             await event.respond(
                 f"📏 **CONFIGURATION DES ÉCARTS**\n\n"
                 f"Écart minimum actuel: **{MIN_GAP_BETWEEN_PREDICTIONS}** numéros\n\n"
-                f"💡 Règle: Une prédiction ne peut être lancée que si l'écart "
-                f"avec la dernière prédiction est d'au moins {MIN_GAP_BETWEEN_PREDICTIONS} numéros.\n\n"
-                f"**Usage:**\n"
-                f"`/gap [2-10]` - Définir l'écart minimum\n"
-                f"Exemple: `/gap 3` pour 3 numéros d'écart minimum"
+                f"💡 Les prédictions doivent être espacées d'au moins {MIN_GAP_BETWEEN_PREDICTIONS} numéros\n\n"
+                f"**Usage:** `/gap [2-10]`"
             )
             return
         
@@ -854,9 +900,8 @@ async def cmd_gap(event):
             
             await event.respond(
                 f"✅ **Écart modifié**\n\n"
-                f"Ancien: {old_gap} numéros\n"
-                f"Nouveau: **{gap_val}** numéros\n\n"
-                f"💡 Les prochaines prédictions respecteront cet écart minimum."
+                f"Ancien: {old_gap}\n"
+                f"Nouveau: **{gap_val}**"
             )
             logger.info(f"Admin change écart: {old_gap} → {gap_val}")
             
@@ -867,8 +912,55 @@ async def cmd_gap(event):
         logger.error(f"Erreur cmd_gap: {e}")
         await event.respond(f"❌ Erreur: {e}")
 
+async def cmd_queue(event):
+    """NOUVEAU: Voir la file d'attente de prédictions."""
+    global prediction_queue
+    
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    
+    lines = [
+        "📋 **FILE D'ATTENTE DES PRÉDICTIONS**",
+        f"Écart minimum: {MIN_GAP_BETWEEN_PREDICTIONS} numéros",
+        f"Envoi quand canal >= N-{PREDICTION_SEND_AHEAD}",
+        "",
+    ]
+    
+    if not prediction_queue:
+        lines.append("❌ Aucune prédiction en attente")
+    else:
+        lines.append(f"**{len(prediction_queue)} prédictions en attente:**\n")
+        
+        for i, pred in enumerate(prediction_queue, 1):
+            suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
+            pred_type = pred['type']
+            pred_num = pred['game_number']
+            distance = pred_num - current_game_number
+            
+            if pred_type == 'distribution':
+                type_str = "🎯 Distrib"
+            elif pred_type == 'compteur2':
+                type_str = "📊 Cpt2"
+            else:
+                type_str = "🤖 Auto"
+            
+            if current_game >= pred_num - PREDICTION_SEND_AHEAD:
+                status = "🟢 PRÊT (attente conflit)"
+            else:
+                status = f"⏳ Dans {pred_num - PREDICTION_SEND_AHEAD - current_game} numéros"
+            
+            lines.append(f"{i}. #{pred_num} {suit} | {type_str} | {status}")
+    
+    lines.append("")
+    lines.append(f"🎮 Canal actuel: #{current_game_number}")
+    lines.append(f"🎯 Dernier envoyé: #{last_prediction_number_sent if last_prediction_number_sent else 'Aucune'}")
+    
+    await event.respond("\n".join(lines))
+
 async def cmd_compteur2(event):
-    """Commande /compteur2 - Gestion interne (ne s'affiche plus dans les messages)."""
     global compteur2_seuil_B, compteur2_active, compteur2_trackers
     
     if event.is_group or event.is_channel:
@@ -886,42 +978,32 @@ async def cmd_compteur2(event):
             lines = [
                 "📊 **COMPTEUR2 (INTERNE)**",
                 f"Statut: {status_str}",
-                f"🎯 Seuil B (prédiction): {compteur2_seuil_B}",
-                f"📏 Écart minimum: {MIN_GAP_BETWEEN_PREDICTIONS} numéros",
+                f"🎯 Seuil B: {compteur2_seuil_B}",
+                f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}",
+                f"📋 File d'attente: {len(prediction_queue)}",
                 f"🎮 Dernier jeu: #{current_game_number}",
-                f"📋 Prédictions actives: {len(pending_predictions)}",
-                f"📦 En buffer: {len(prediction_buffer)}",
-                f"🎯 Dernière prédiction: #{last_prediction_number_sent if last_prediction_number_sent else 'Aucune'}",
                 "",
-                "📈 **Compteurs actuels:**"
+                "📈 **Compteurs:**"
             ]
             
             for suit in ALL_SUITS:
                 tracker = compteur2_trackers.get(suit)
                 if tracker:
                     progress = min(tracker.counter, compteur2_seuil_B)
-                    bar_filled = '█' * progress
-                    bar_empty = '░' * (compteur2_seuil_B - progress)
-                    bar = f"[{bar_filled}{bar_empty}]"
+                    bar = f"[{'█' * progress}{'░' * (compteur2_seuil_B - progress)}]"
                     
                     if tracker.counter >= compteur2_seuil_B:
                         status = "🔮 PRÊT"
                     elif tracker.counter > 0:
-                        status = f"⏳ En cours ({tracker.counter}/{compteur2_seuil_B})"
+                        status = f"⏳ {tracker.counter}/{compteur2_seuil_B}"
                     else:
-                        status = "✅ En attente"
+                        status = "✅ Attente"
                     
                     lines.append(f"{tracker.get_display_name()}: {bar} {status}")
             
             lines.extend([
                 "",
-                f"💡 **Envoi différé:** Les prédictions sont envoyées quand le canal est à N-{PREDICTION_SEND_AHEAD}",
-                "",
-                "**Usage:**",
-                "`/compteur2 [2-10]` - Définir le seuil B",
-                "`/compteur2 on` - Activer",
-                "`/compteur2 off` - Désactiver",
-                "`/compteur2 reset` - Reset les compteurs"
+                "**Usage:** `/compteur2 [2-10/on/off/reset]`"
             ])
             
             await event.respond("\n".join(lines))
@@ -932,96 +1014,35 @@ async def cmd_compteur2(event):
         if arg == 'off':
             compteur2_active = False
             await event.respond("❌ **Compteur2 DÉSACTIVÉ**")
-            logger.info("Admin désactive Compteur2")
-            return
-        
-        if arg == 'on':
+        elif arg == 'on':
             compteur2_active = True
             await event.respond("✅ **Compteur2 ACTIVÉ**")
-            logger.info("Admin active Compteur2")
-            return
-        
-        if arg == 'reset':
+        elif arg == 'reset':
             for tracker in compteur2_trackers.values():
                 tracker.counter = 0
                 tracker.last_increment_game = 0
-            prediction_buffer.clear()
-            await event.respond("🔄 **Compteurs Compteur2 et buffer remis à zéro**")
-            logger.info("Admin reset Compteur2")
-            return
-        
-        try:
-            b_val = int(arg)
-            if not 2 <= b_val <= 10:
-                await event.respond("❌ B doit être entre 2 et 10")
-                return
-            
-            old_b = compteur2_seuil_B
-            compteur2_seuil_B = b_val
-            
-            await event.respond(
-                f"✅ **Seuil B modifié**\n\n"
-                f"Ancien: {old_b}\n"
-                f"Nouveau: **{compteur2_seuil_B}**\n\n"
-                f"💡 Règle interne: {compteur2_seuil_B} manques consécutifs → prédiction N+2"
-            )
-            logger.info(f"Admin change seuil B: {old_b} → {b_val}")
-            
-        except ValueError:
-            await event.respond("❌ Usage: `/compteur2 [2-10]`, `/compteur2 on/off/reset`")
-            
+            prediction_queue.clear()
+            await event.respond("🔄 **Compteurs et file remis à zéro**")
+        else:
+            try:
+                b_val = int(arg)
+                if not 2 <= b_val <= 10:
+                    await event.respond("❌ B doit être entre 2 et 10")
+                    return
+                
+                old_b = compteur2_seuil_B
+                compteur2_seuil_B = b_val
+                
+                await event.respond(f"✅ **Seuil B: {old_b} → {b_val}**")
+                logger.info(f"Admin change seuil B: {old_b} → {b_val}")
+            except ValueError:
+                await event.respond("❌ Usage: `/compteur2 [2-10/on/off/reset]`")
+                
     except Exception as e:
         logger.error(f"Erreur cmd_compteur2: {e}")
         await event.respond(f"❌ Erreur: {e}")
 
-async def cmd_buffer(event):
-    """NOUVEAU: Commande /buffer - Voir les prédictions en attente."""
-    global prediction_buffer
-    
-    if event.is_group or event.is_channel:
-        return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
-        await event.respond("🔒 Admin uniquement")
-        return
-    
-    lines = [
-        "📦 **BUFFER DE PRÉDICTIONS**",
-        f"Envoi quand canal est à N-{PREDICTION_SEND_AHEAD}",
-        "",
-    ]
-    
-    if not prediction_buffer:
-        lines.append("❌ Aucune prédiction en attente")
-    else:
-        # Trier par numéro de prédiction
-        sorted_preds = sorted(prediction_buffer.items())
-        
-        for pred_game, pred_info in sorted_preds:
-            suit = SUIT_DISPLAY.get(pred_info['suit'], pred_info['suit'])
-            pred_type = pred_info['type']
-            distance = pred_game - current_game_number
-            
-            if pred_type == 'distribution':
-                type_str = "🎯 Distrib"
-            elif pred_type == 'compteur2':
-                type_str = "📊 Cpt2"
-            else:
-                type_str = "🤖 Auto"
-            
-            if distance <= PREDICTION_SEND_AHEAD:
-                status = "🟢 Prêt à envoyer"
-            else:
-                status = f"⏳ Dans {distance - PREDICTION_SEND_AHEAD} numéros"
-            
-            lines.append(f"• #{pred_game} {suit} | {type_str} | {status}")
-    
-    lines.append("")
-    lines.append(f"🎮 Canal source actuel: #{current_game_number}")
-    
-    await event.respond("\n".join(lines))
-
 async def cmd_history(event):
-    """Commande /history - Affiche l'historique avec la règle utilisée."""
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
@@ -1029,63 +1050,45 @@ async def cmd_history(event):
         return
     
     lines = [
-        "📜 **HISTORIQUE DES PRÉDICTIONS**",
-        "═══════════════════════════════════════",
+        "📜 **HISTORIQUE**",
+        "═══════════════════",
         ""
     ]
     
-    recent_predictions = prediction_history[:10]
+    recent = prediction_history[:10]
     
-    if not recent_predictions:
-        lines.append("❌ Aucune prédiction dans l'historique")
+    if not recent:
+        lines.append("❌ Aucune prédiction")
     else:
-        for i, pred in enumerate(recent_predictions, 1):
-            pred_game = pred['predicted_game']
+        for i, pred in enumerate(recent, 1):
             suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
             status = pred['status']
             pred_time = pred['predicted_at'].strftime('%H:%M:%S')
-            pred_type = pred.get('type', 'standard')
             
-            # Afficher la règle utilisée
-            if pred_type == 'distribution':
-                rule_str = "🎯 Distribution #R"
-            elif pred_type == 'compteur2':
-                rule_str = "📊 Compteur2"
+            if pred.get('type') == 'distribution':
+                rule = f"🎯#R(+{DISTRIBUTION_PLUS_VALUE})"
+            elif pred.get('type') == 'compteur2':
+                rule = "📊C2"
             else:
-                rule_str = "🤖 Standard"
+                rule = "🤖"
             
-            if status == 'en_cours':
-                status_str = "⏳ En cours..."
-                result_emoji = "🎰"
-            elif status == 'gagne_r0':
-                status_str = "✅ GAGNÉ DIRECT"
-                result_emoji = "🏆"
-            elif status == 'gagne_r1':
-                status_str = "✅ GAGNÉ R1"
-                result_emoji = "🏆"
-            elif status == 'gagne_r2':
-                status_str = "✅ GAGNÉ R2"
-                result_emoji = "🏆"
-            elif status == 'perdu':
-                status_str = "❌ PERDU"
-                result_emoji = "💔"
-            else:
-                status_str = f"❓ {status}"
-                result_emoji = "❓"
+            emojis = {
+                'en_cours': '🎰',
+                'gagne_r0': '🏆',
+                'gagne_r1': '🏆',
+                'gagne_r2': '🏆',
+                'perdu': '💔'
+            }
+            emoji = emojis.get(status, '❓')
             
-            lines.append(f"{i}. {result_emoji} **#{pred_game}** {suit} | {status_str}")
-            lines.append(f"   🕐 {pred_time} | {rule_str}")
-            
-            if pred.get('verified_by_game'):
-                lines.append(f"   ✅ Vérifié au jeu #{pred['verified_by_game']}")
-            
+            lines.append(f"{i}. {emoji} **#{pred['predicted_game']}** {suit} | {rule} | {status}")
+            lines.append(f"   🕐 {pred_time}")
             lines.append("")
     
     await event.respond("\n".join(lines))
 
 async def cmd_status(event):
-    """Commande /status - Statut du système."""
-    global compteur2_active, compteur2_seuil_B
+    global compteur2_active, compteur2_seuil_B, DISTRIBUTION_PLUS_VALUE
     
     if event.is_group or event.is_channel:
         return
@@ -1095,80 +1098,48 @@ async def cmd_status(event):
     
     compteur2_str = "✅ ON" if compteur2_active else "❌ OFF"
     
-    # Info prédictions actives
     active_info = []
     for num, pred in sorted(pending_predictions.items()):
         suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
         rattrapage = pred.get('rattrapage', 0)
         current_check = pred.get('current_check', num)
-        verified = len(pred.get('verified_games', []))
         
-        if rattrapage == 0 and verified == 0:
+        if rattrapage == 0:
             status = f"⏳ Vérification #{current_check}"
-        elif rattrapage > 0:
-            status = f"⏳ Rattrapage R{rattrapage} (🔵#{current_check})"
         else:
-            status = f" {verified}/3 vérifiés"
+            status = f"⏳ R{rattrapage} (🔵#{current_check})"
         
         active_info.append(f"• #{num} {suit}: {status}")
     
-    # Info buffer
-    buffer_info = []
-    if prediction_buffer:
-        for pred_game in sorted(prediction_buffer.keys())[:5]:  # Max 5 affichées
-            pred_info = prediction_buffer[pred_game]
-            suit = SUIT_DISPLAY.get(pred_info['suit'], pred_info['suit'])
-            distance = pred_game - current_game_number
-            buffer_info.append(f"• #{pred_game} {suit} (dans {distance})")
+    queue_info = []
+    for pred in prediction_queue[:5]:
+        suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
+        queue_info.append(f"• #{pred['game_number']} {suit}")
     
     lines = [
-        "📊 **STATUT DU SYSTÈME**",
+        "📊 **STATUT**",
         "",
-        f"📏 Écart minimum: **{MIN_GAP_BETWEEN_PREDICTIONS}** numéros",
-        f"📊 Compteur2 (interne): {compteur2_str} (seuil B={compteur2_seuil_B})",
-        f"📦 Buffer: {len(prediction_buffer)} prédictions en attente",
-        f"⏱️ Envoi différé: N-{PREDICTION_SEND_AHEAD}",
-        f"🎮 Dernier jeu: #{current_game_number}",
-        f"🎯 Dernière prédiction: #{last_prediction_number_sent if last_prediction_number_sent else 'Aucune'}",
-        f"📋 Prédictions actives: {len(pending_predictions)}",
+        f"➕ Distribution: +{DISTRIBUTION_PLUS_VALUE}",
+        f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}",
+        f"📊 Compteur2: {compteur2_str} (B={compteur2_seuil_B})",
+        f"📋 File: {len(prediction_queue)} | Actives: {len(pending_predictions)}",
+        f"⏱️ Envoi: N-{PREDICTION_SEND_AHEAD}",
+        f"🎮 Canal: #{current_game_number}",
+        f"🎯 Dernier: #{last_prediction_number_sent if last_prediction_number_sent else '-'}",
         ""
     ]
     
     if active_info:
-        lines.append("**🔮 PRÉDICTIONS EN COURS:**")
+        lines.append("**🔮 Actives:**")
         lines.extend(active_info)
         lines.append("")
     
-    if buffer_info:
-        lines.append("**📦 EN BUFFER (prochaines):**")
-        lines.extend(buffer_info)
+    if queue_info:
+        lines.append("**📋 File (top 5):**")
+        lines.extend(queue_info)
         lines.append("")
     
-    lines.append("📊 **COMPTEUR2 (INTERNE)**")
-    lines.append("─────────────────────")
-    for suit in ALL_SUITS:
-        tracker = compteur2_trackers.get(suit)
-        if tracker:
-            progress = min(tracker.counter, compteur2_seuil_B)
-            bar_filled = '█' * progress
-            bar_empty = '░' * (compteur2_seuil_B - progress)
-            bar = f"[{bar_filled}{bar_empty}]"
-            
-            if tracker.counter >= compteur2_seuil_B:
-                status = "🔮 PRÊT"
-            elif tracker.counter > 0:
-                status = f"⏳ En cours ({tracker.counter}/{compteur2_seuil_B})"
-            else:
-                status = "✅ En attente"
-            
-            lines.append(f"{tracker.get_display_name()}: {bar} {status}")
-    
-    lines.append("")
-    lines.extend([
-        "**Légende:**",
-        "🔵=En cours de vérification ✅=Trouvé ⏳=Attente 🔮=Prêt",
-        "🎯=Distribution #R 📊=Compteur2 (internes)"
-    ])
+    lines.append("**/queue** pour voir toute la file")
     
     await event.respond("\n".join(lines))
 
@@ -1176,45 +1147,26 @@ async def cmd_help(event):
     if event.is_group or event.is_channel:
         return
     
-    help_text = f"""📖 **BACCARAT AI - AIDE COMPLÈTE**
+    help_text = f"""📖 **BACCARAT AI**
 
-**🎮 Systèmes de prédiction (internes):**
+**🎮 Systèmes:**
+• 🎯 Distribution #R → N+{DISTRIBUTION_PLUS_VALUE}
+• 📊 Compteur2 → N+2 (seuil B)
 
-1️⃣ **Distribution (#R)**
-• Message avec #R et finalisé
-• Vérifie 1er ET 2ème groupe de parenthèses
-• Si 1 costume manquant exactement → prédit #N+5
+**📋 Règles:**
+• Écart minimum: **{MIN_GAP_BETWEEN_PREDICTIONS}** numéros
+• Plusieurs prédictions possibles en file d'attente
+• Envoi différé: N-{PREDICTION_SEND_AHEAD}
+• Vérification dynamique avec 🔵
 
-2️⃣ **Compteur2**
-• Compte costumes manquants dans 1er groupe
-• Incrémente quand absent, reset quand présent
-• Seuil B atteint → prédit N+2
-
-**📋 Règles de sécurité:**
-• Écart minimum: **{MIN_GAP_BETWEEN_PREDICTIONS}** numéros entre prédictions
-• ⏱️ **Envoi différé**: Les prédictions sont envoyées quand le canal source est à N-{PREDICTION_SEND_AHEAD}
-• Vérification dynamique sur 3 numéros (prédit, +1, +2)
-• 🔵 indique le numéro en cours de vérification
-• Les numéros vérifiés et perdus disparaissent de la ligne
-• Auto-reset si blocage
-• Reset complet au #1440
-
-**🔧 Commandes Admin:**
-
-`/status` - Voir tous les compteurs
-`/buffer` - Voir les prédictions en attente d'envoi
-`/compteur2 [B/on/off/reset]` - Gérer Compteur2 (interne)
-`/gap [2-10]` - Configurer l'écart minimum
-`/history` - Historique des prédictions (avec règle utilisée)
-`/reset` - Reset manuel complet
-`/help` - Cette aide
-
-**💡 Exemple de flux:**
-1. Bot détecte prédiction #70 à #65 → mis en buffer
-2. Canal arrive à #68 → envoi de la prédiction
-3. Message: `🔍 Vérification: 🔵70 | #71 | #72`
-4. Si #70 perdu → `🔍 Vérification: 🔵71 | #72` (70 disparaît)
-5. Si #71 gagné → `🏆 ... ✅1️⃣GAGNÉ R1`
+**🔧 Commandes:**
+`/plus [1-20]` - Valeur #R
+`/gap [2-10]` - Écart minimum
+`/queue` - Voir la file d'attente
+`/compteur2 [B/on/off/reset]`
+`/status` - Statut complet
+`/history` - Historique
+`/reset` - Reset manuel
 
 🤖 Baccarat AI"""
     
@@ -1227,14 +1179,15 @@ async def cmd_reset(event):
         await event.respond("🔒 Admin uniquement")
         return
     
-    await event.respond("🔄 Reset en cours...")
+    await event.respond("🔄 Reset...")
     await perform_full_reset("Reset manuel")
     await event.respond("✅ Reset effectué!")
 
 def setup_handlers():
+    client.add_event_handler(cmd_plus, events.NewMessage(pattern=r'^/plus'))
     client.add_event_handler(cmd_gap, events.NewMessage(pattern=r'^/gap'))
+    client.add_event_handler(cmd_queue, events.NewMessage(pattern=r'^/queue$'))
     client.add_event_handler(cmd_compteur2, events.NewMessage(pattern=r'^/compteur2'))
-    client.add_event_handler(cmd_buffer, events.NewMessage(pattern=r'^/buffer$'))  # NOUVEAU
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
     client.add_event_handler(cmd_history, events.NewMessage(pattern=r'^/history$'))
     client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
@@ -1259,13 +1212,11 @@ async def start_bot():
                 pred_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
                 if pred_entity:
                     prediction_channel_ok = True
-                    logger.info(f"✅ Canal prédiction OK: {getattr(pred_entity, 'title', 'Unknown')}")
-                else:
-                    logger.error(f"❌ Canal prédition inaccessible: {PREDICTION_CHANNEL_ID}")
+                    logger.info(f"✅ Canal prédiction OK")
             except Exception as e:
-                logger.error(f"❌ Erreur vérification canal prédiction: {e}")
+                logger.error(f"❌ Erreur canal prédiction: {e}")
         
-        logger.info("🤖 Bot démarré avec succès")
+        logger.info("🤖 Bot démarré")
         return True
         
     except Exception as e:
@@ -1278,7 +1229,6 @@ async def main():
             return
         
         asyncio.create_task(auto_reset_system())
-        logger.info("🔄 Auto-reset démarré")
         
         app = web.Application()
         app.router.add_get('/health', lambda r: web.Response(text="OK"))
@@ -1291,9 +1241,9 @@ async def main():
         await site.start()
         
         logger.info(f"🌐 Web server port {PORT}")
-        logger.info(f"📊 Écart minimum: {MIN_GAP_BETWEEN_PREDICTIONS} numéros")
-        logger.info(f"⏱️ Envoi différé: N-{PREDICTION_SEND_AHEAD}")
-        logger.info(f"📊 Compteur2: {'Actif B=' + str(compteur2_seuil_B) if compteur2_active else 'Inactif'}")
+        logger.info(f"➕ Distribution: +{DISTRIBUTION_PLUS_VALUE}")
+        logger.info(f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}")
+        logger.info(f"📋 File d'attente: ACTIVE")
         
         await client.run_until_disconnected()
         
@@ -1302,13 +1252,12 @@ async def main():
     finally:
         if client and client.is_connected():
             await client.disconnect()
-            logger.info("🔌 Déconnecté")
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Arrêté par l'utilisateur")
+        logger.info("Arrêté")
     except Exception as e:
         logger.error(f"Fatal: {e}")
         sys.exit(1)
