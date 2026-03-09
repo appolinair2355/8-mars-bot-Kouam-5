@@ -74,7 +74,7 @@ DISTRIBUTION_CHANNEL_ID = None  # Canal spécifique pour Distribution #R
 COMPTEUR2_CHANNEL_ID = None     # Canal spécifique pour Compteur2
 
 # ============================================================================
-# SYSTÈME DE PAUSE PAR CYCLE (INDÉPENDANT)
+# SYSTÈME DE PAUSE PAR CYCLE (CORRIGÉ)
 # ============================================================================
 
 # État de la pause
@@ -295,11 +295,20 @@ def block_suit(suit: str, minutes: int = 5):
     logger.info(f"🔒 {suit} bloqué {minutes}min")
 
 # ============================================================================
-# SYSTÈME DE PAUSE - GESTION
+# SYSTÈME DE PAUSE - GESTION (CORRIGÉ)
 # ============================================================================
 
 def format_pause_message(duration_min: int, remaining_seconds: int) -> str:
     """Formate le message de pause avec temps dynamique."""
+    # CORRECTION: Si temps écoulé ou négatif, afficher message de fin
+    if remaining_seconds <= 0:
+        return f"""⏸️ PAUSE TERMINÉE
+
+✅ Fin de la pause
+🔄 Préparation de la reprise...
+
+🤖 Baccarat AI"""
+    
     minutes = remaining_seconds // 60
     seconds = remaining_seconds % 60
     
@@ -314,7 +323,7 @@ def format_resume_message() -> str:
     """Choisit une expression aléatoire de reprise."""
     return random.choice(RESUME_EXPRESSIONS)
 
-async def update_pause_message(duration_min: int, total_seconds: int):
+async def update_pause_message(duration_min: int, remaining_seconds: int):
     """Met à jour le message de pause en temps réel."""
     global pause_message_id, pause_active, pause_end_time
     
@@ -326,11 +335,10 @@ async def update_pause_message(duration_min: int, total_seconds: int):
         if not prediction_entity:
             return
         
-        remaining = int((pause_end_time - datetime.now()).total_seconds())
-        if remaining < 0:
-            remaining = 0
+        # CORRECTION: Ne jamais afficher de temps négatif
+        display_seconds = max(0, remaining_seconds)
         
-        msg = format_pause_message(duration_min, remaining)
+        msg = format_pause_message(duration_min, display_seconds)
         
         await client.edit_message(prediction_entity, pause_message_id, msg, parse_mode='markdown')
         
@@ -343,7 +351,9 @@ async def pause_countdown_task(duration_min: int):
     
     total_seconds = duration_min * 60
     
-    for i in range(total_seconds, -1, -1):
+    # CORRECTION: Boucle de total_seconds down to 1 (pas 0)
+    # Et vérifier si la pause est toujours active
+    for i in range(total_seconds, 0, -1):
         if not pause_active:
             logger.info("⏸️ Pause annulée manuellement")
             return
@@ -351,8 +361,10 @@ async def pause_countdown_task(duration_min: int):
         await update_pause_message(duration_min, i)
         await asyncio.sleep(1)
     
-    # Pause terminée
-    await end_pause()
+    # CORRECTION: Quand on sort de la boucle (i=0), temps écoulé
+    if pause_active:
+        logger.info("⏸️ Temps écoulé, fin de pause automatique")
+        await end_pause()
 
 async def start_pause():
     """Démarre une pause."""
@@ -399,6 +411,10 @@ async def end_pause():
     # Annuler la tâche si encore active
     if pause_task and not pause_task.done():
         pause_task.cancel()
+        try:
+            await pause_task
+        except asyncio.CancelledError:
+            pass
     
     # Envoyer message de reprise
     try:
@@ -406,7 +422,7 @@ async def end_pause():
         if prediction_entity and pause_message_id:
             resume_msg = format_resume_message()
             
-            # Éditer le dernier message de pause
+            # Éditer le dernier message de pause avec message de reprise
             await client.edit_message(
                 prediction_entity, 
                 pause_message_id, 
@@ -418,6 +434,12 @@ async def end_pause():
             
             # Reset message_id pour prochaine pause
             pause_message_id = None
+            
+            # CORRECTION: Traiter immédiatement la file d'attente si des prédictions attendent
+            if prediction_queue:
+                logger.info(f"📤 {len(prediction_queue)} prédictions en attente, traitement...")
+                await process_prediction_queue(current_game_number)
+                
     except Exception as e:
         logger.error(f"❌ Erreur fin pause: {e}")
 
@@ -884,14 +906,21 @@ async def process_prediction_queue(current_game: int):
         logger.info(f"✅ #{pred['game_number']} retiré de la file. Restant: {len(prediction_queue)}")
 
 # ============================================================================
-# TRAITEMENT DES MESSAGES
+# TRAITEMENT DES MESSAGES (CORRIGÉ)
 # ============================================================================
 
 async def process_game_result(game_number: int, message_text: str):
-    global current_game_number, last_source_game_number
+    global current_game_number, last_source_game_number, pause_active, pause_end_time
     
     current_game_number = game_number
     last_source_game_number = game_number
+    
+    # CORRECTION: Vérifier si la pause devrait être terminée avant tout traitement
+    if pause_active and pause_end_time:
+        remaining = (pause_end_time - datetime.now()).total_seconds()
+        if remaining <= 0:
+            logger.info("⏸️ Pause expirée détectée, reprise automatique")
+            await end_pause()
     
     # Vérification auto-reset uniquement au #1440
     if current_game_number >= 1440:
@@ -914,7 +943,7 @@ async def process_game_result(game_number: int, message_text: str):
     # Vérification des prédictions existantes
     await check_prediction_result(game_number, first_group)
     
-    # Traiter la file d'attente (si pas en pause)
+    # Traiter la file d'attente (si pas en pause, ou si pause vient de finir)
     await process_prediction_queue(game_number)
     
     # Si en pause, ne pas détecter de nouvelles prédictions
@@ -999,7 +1028,7 @@ async def handle_edited_message(event):
     await handle_message(event, True)
 
 # ============================================================================
-# RESET ET NOTIFICATIONS
+# RESET ET NOTIFICATIONS (CORRIGÉ)
 # ============================================================================
 
 async def notify_admin_reset(reason: str, stats: int, queue_stats: int):
@@ -1029,10 +1058,20 @@ async def notify_admin_reset(reason: str, stats: int, queue_stats: int):
         logger.error(f"❌ Impossible de notifier l'admin: {e}")
 
 async def auto_reset_system():
-    """Mode veille - plus de reset à 1h00."""
+    """Mode veille avec vérification de pause bloquée."""
+    global pause_active, pause_end_time
+    
     while True:
         try:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(60)  # Vérifier chaque minute
+            
+            # CORRECTION: Vérifier si la pause est bloquée (temps dépassé mais toujours active)
+            if pause_active and pause_end_time:
+                remaining = (pause_end_time - datetime.now()).total_seconds()
+                if remaining <= -30:  # 30 secondes de marge après expiration
+                    logger.warning("🚨 Pause bloquée détectée (temps dépassé), auto-correction...")
+                    await end_pause()
+                    
         except Exception as e:
             logger.error(f"❌ Erreur auto_reset: {e}")
             await asyncio.sleep(60)
@@ -1050,6 +1089,10 @@ async def perform_full_reset(reason: str):
         pause_active = False
         if pause_task and not pause_task.done():
             pause_task.cancel()
+            try:
+                await pause_task
+            except asyncio.CancelledError:
+                pass
         pause_message_id = None
         pause_end_time = None
     
@@ -1101,6 +1144,8 @@ async def cmd_pause(event):
                     mins = remaining // 60
                     secs = remaining % 60
                     time_info = f"\n⏳ Temps restant: {mins}:{secs:02d}"
+                else:
+                    time_info = "\n⏳ Temps écoulé (devrait se terminer...)"
             
             current_duration = PAUSE_CYCLE[pause_cycle_index % len(PAUSE_CYCLE)] if not pause_active else "En cours"
             
@@ -1159,18 +1204,13 @@ async def cmd_pausecycle(event):
         
         # Afficher cycle actuel
         if len(parts) == 1:
-            await event.respond(
-                f"🔄 **CYCLE DE PAUSE**\n\n"
-                f"Cycle actuel: **{PAUSE_CYCLE}** minutes\n\n"
-                f"Ordre des pauses:\n"
-            )
+            cycle_text = f"🔄 **CYCLE DE PAUSE**\n\nCycle actuel: **{PAUSE_CYCLE}** minutes\n\nOrdre des pauses:\n"
             
             for i, duration in enumerate(PAUSE_CYCLE, 1):
-                await event.respond(f"{i}. Pause #{i}: {duration} minutes")
+                cycle_text += f"{i}. Pause #{i}: {duration} minutes\n"
             
-            await event.respond(
-                f"\n**Usage:** `/pausecycle 3,5,4,6` (durées en minutes, séparées par des virgules)"
-            )
+            cycle_text += f"\n**Usage:** `/pausecycle 3,5,4,6` (durées en minutes, séparées par des virgules)"
+            await event.respond(cycle_text)
             return
         
         # Modifier cycle
@@ -1218,19 +1258,14 @@ async def cmd_pauseadd(event):
         parts = event.message.message.split(' ', 1)
         
         if len(parts) < 2:
+            examples = random.sample(RESUME_EXPRESSIONS, min(5, len(RESUME_EXPRESSIONS)))
+            examples_text = "\n".join([f"{i+1}. {ex[:50]}..." for i, ex in enumerate(examples)])
+            
             await event.respond(
                 f"📝 **EXPRESSIONS DE REPRISE**\n\n"
                 f"Nombre actuel: **{len(RESUME_EXPRESSIONS)}** expressions\n\n"
-                f"Exemples:\n"
-            )
-            
-            # Montrer 5 exemples aléatoires
-            examples = random.sample(RESUME_EXPRESSIONS, min(5, len(RESUME_EXPRESSIONS)))
-            for i, ex in enumerate(examples, 1):
-                await event.respond(f"{i}. {ex[:50]}...")
-            
-            await event.respond(
-                f"\n**Usage:** `/pauseadd Votre expression ici - Sossou Kouamé`"
+                f"Exemples:\n{examples_text}\n\n"
+                f"**Usage:** `/pauseadd Votre expression ici - Sossou Kouamé`"
             )
             return
         
@@ -1704,7 +1739,7 @@ def setup_handlers():
     client.add_event_handler(cmd_canal_compteur2, events.NewMessage(pattern=r'^/canalcompteur2'))
     client.add_event_handler(cmd_canaux, events.NewMessage(pattern=r'^/canaux$'))
     
-    # Pause (NOUVEAU)
+    # Pause (CORRIGÉ)
     client.add_event_handler(cmd_pause, events.NewMessage(pattern=r'^/pause'))
     client.add_event_handler(cmd_pausecycle, events.NewMessage(pattern=r'^/pausecycle'))
     client.add_event_handler(cmd_pauseadd, events.NewMessage(pattern=r'^/pauseadd'))
@@ -1732,7 +1767,7 @@ async def start_bot():
         setup_handlers()
         initialize_trackers()
         
-        if PREDICTION_CHANNEL_ID:
+                if PREDICTION_CHANNEL_ID:
             try:
                 pred_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
                 if pred_entity:
@@ -1753,6 +1788,7 @@ async def main():
         if not await start_bot():
             return
         
+        # CORRECTION: Démarrer la vérification périodique avec vérification de pause bloquée
         asyncio.create_task(auto_reset_system())
         
         app = web.Application()
@@ -1770,6 +1806,7 @@ async def main():
         logger.info(f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}")
         logger.info(f"⏸️ Pause cycle: {PAUSE_CYCLE} min")
         logger.info(f"📡 Multi-canaux: ACTIVE")
+        logger.info(f"✅ Système de pause corrigé - vérification auto toutes les 60s")
         
         await client.run_until_disconnected()
         
@@ -1787,3 +1824,4 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"Fatal: {e}")
         sys.exit(1)
+
