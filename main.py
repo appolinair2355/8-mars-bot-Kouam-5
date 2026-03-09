@@ -730,7 +730,7 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
     return False
 
 # ============================================================================
-# GESTION #R ET COMPTEUR2 (interne uniquement)
+# GESTION #R ET COMPTEUR2 (CORRIGÉ - #R + #X ignoré)
 # ============================================================================
 
 def extract_first_two_groups(message: str) -> tuple:
@@ -743,6 +743,11 @@ def extract_first_two_groups(message: str) -> tuple:
 
 def check_distribution_rule(game_number: int, message_text: str) -> Optional[tuple]:
     global DISTRIBUTION_PLUS_VALUE
+    
+    # CORRECTION IMPORTANTE: Si #R ET #X sont présents ensemble, ne pas utiliser cette règle
+    if '#R' in message_text and '#X' in message_text:
+        logger.info(f"🚫 #R et #X détectés ensemble au jeu #{game_number} - Distribution ignorée")
+        return None
     
     if '#R' not in message_text:
         return None
@@ -950,7 +955,7 @@ async def process_game_result(game_number: int, message_text: str):
         logger.info(f"⏸️ En pause, pas de nouvelle détection")
         return
     
-    # Distribution #R - Ajouter à la file si écart OK
+    # Distribution #R - CORRECTION: Ignorer si #R et #X ensemble
     distribution_result = check_distribution_rule(game_number, message_text)
     if distribution_result:
         suit, pred_num = distribution_result
@@ -958,7 +963,7 @@ async def process_game_result(game_number: int, message_text: str):
         if added:
             logger.info(f"🎯 Distribution: #{pred_num} en file d'attente")
     
-    # Compteur2 - Ajouter à la file si écart OK
+    # Compteur2 - Ajouter à la file si écart OK (fonctionne toujours)
     if compteur2_active:
         update_compteur2(game_number, first_group)
         
@@ -1805,6 +1810,7 @@ async def main():
         logger.info(f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}")
         logger.info(f"⏸️ Pause cycle: {PAUSE_CYCLE} min")
         logger.info(f"📡 Multi-canaux: ACTIVE")
+        logger.info(f"🚫 #R+#X ignorés ensemble")
         logger.info(f"✅ Système de pause corrigé - vérification auto toutes les 60s")
         
         await client.run_until_disconnected()
