@@ -2,19 +2,21 @@
 Configuration du bot Baccarat AI - Version sans cycles
 """
 
+import os
+
 # ============================================================================
 # TELEGRAM API CREDENTIALS
 # ============================================================================
 
-API_ID = 29177661
-API_HASH = "a8639172fa8d35dbfd8ea46286d349ab"
-BOT_TOKEN = "7663403310:AAHEmW-FzB1hvV9_FXTJxcdGt_hjrc3dJSk"
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # ============================================================================
 # ADMIN ET CANAUX
 # ============================================================================
 
-ADMIN_ID = 1190237801
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 SOURCE_CHANNEL_ID = -1002682552255
 PREDICTION_CHANNEL_ID = -1003501017916
 
@@ -22,7 +24,7 @@ PREDICTION_CHANNEL_ID = -1003501017916
 # PARAMÈTRES DU SERVEUR WEB
 # ============================================================================
 
-PORT = 10000
+PORT = int(os.environ.get("PORT", 8000))
 
 # ============================================================================
 # CONFIGURATION COSTUMES

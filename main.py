@@ -70,7 +70,7 @@ compteur1_history: List[Dict] = []  # Historique des séries ≥3
 MIN_CONSECUTIVE_FOR_STATS = 3  # Minimum pour apparaître dans /stats
 
 # Gestion des écarts entre prédictions
-MIN_GAP_BETWEEN_PREDICTIONS = 2  # Écart minimum entre 2 prédictions
+MIN_GAP_BETWEEN_PREDICTIONS = 3  # Écart minimum entre 2 prédictions
 last_prediction_number_sent = 0  # Dernier numéro de prédiction envoyé
 
 # Historiques pour la commande /history
@@ -478,11 +478,15 @@ async def pause_countdown_task(duration_min: int):
         await end_pause()
 
 async def start_pause():
-    """Démarre une pause."""
+    """Démarre une pause (appelé manuellement via /pause on ou par fin de cycle)."""
     global pause_active, pause_counter, pause_cycle_index, pause_message_id, pause_end_time, pause_task
     
     if pause_active:
         logger.warning("⏸️ Pause déjà active")
+        return
+    
+    if pending_predictions:
+        logger.warning(f"⏸️ start_pause: {len(pending_predictions)} prédiction(s) encore active(s), pause reportée")
         return
     
     duration = PAUSE_CYCLE[pause_cycle_index % len(PAUSE_CYCLE)]
@@ -563,14 +567,18 @@ def increment_pause_counter():
     return False
 
 async def check_and_trigger_pause(game_number: int):
-    """Vérifie si une prédiction terminée doit déclencher la pause."""
+    """Vérifie si une prédiction terminée doit déclencher la pause.
+    La pause ne démarre que lorsque toutes les prédictions en cours sont vérifiées."""
     global pause_counter, pause_active
     
     if pause_active:
         return
     
     if pause_counter >= PREDICTIONS_BEFORE_PAUSE:
-        if game_number in pending_predictions:
+        # Attendre que TOUTES les prédictions en cours soient terminées
+        if pending_predictions:
+            remaining = list(pending_predictions.keys())
+            logger.info(f"⏸️ Pause en attente — prédictions encore actives: {remaining}")
             return
         
         await start_pause()
@@ -591,11 +599,11 @@ def format_prediction_message(game_number: int, suit: str, status: str = 'en_cou
             check_num = game_number + i
             
             if current_check == check_num:
-                verif_parts.append(f"🔵{check_num}")
+                verif_parts.append(f"🔵#{check_num}")
             elif verified_games and check_num in verified_games:
                 continue
             else:
-                verif_parts.append(f"#{check_num}")
+                verif_parts.append(f"⬜#{check_num}")
         
         verif_line = " | ".join(verif_parts)
         
@@ -665,80 +673,141 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
     success = False
     
     if PREDICTION_CHANNEL_ID:
+        # ── VERROU SYNCHRONE ─────────────────────────────────────────────────
+        # Réserver la place dans pending_predictions AVANT tout await.
+        # Si une autre tâche asyncio tourne pendant les awaits ci-dessous,
+        # elle verra pending_predictions non vide et ne lancera pas de 2e prédiction.
+        if game_number in pending_predictions:
+            logger.warning(f"⚠️ #{game_number} déjà réservé dans pending, envoi annulé")
+            return False
+        
+        old_last = last_prediction_number_sent
+        last_prediction_number_sent = game_number  # gap check immédiatement effectif
+        
+        pending_predictions[game_number] = {
+            'suit': suit,
+            'message_id': None,        # sera mis à jour après l'envoi Telegram
+            'status': 'sending',       # placeholder — bloque les vérifications concurrentes
+            'type': prediction_type,
+            'sent_time': datetime.now(),
+            'verification_games': [game_number, game_number + 1, game_number + 2],
+            'verified_games': [],
+            'found_at': None,
+            'rattrapage': 0,
+            'current_check': game_number
+        }
+        # ── FIN VERROU SYNCHRONE ─────────────────────────────────────────────
+        
         msg_id = await send_prediction_to_channel(
             PREDICTION_CHANNEL_ID, game_number, suit, prediction_type, is_secondary=False
         )
         
         if msg_id:
             last_prediction_time = datetime.now()
-            last_prediction_number_sent = game_number
-            
-            pending_predictions[game_number] = {
-                'suit': suit,
-                'message_id': msg_id,
-                'status': 'en_cours',
-                'type': prediction_type,
-                'sent_time': datetime.now(),
-                'verification_games': [game_number, game_number + 1, game_number + 2],
-                'verified_games': [],
-                'found_at': None,
-                'rattrapage': 0,
-                'current_check': game_number
-            }
-            
+            pending_predictions[game_number]['message_id'] = msg_id
+            pending_predictions[game_number]['status'] = 'en_cours'
             add_prediction_to_history(game_number, suit, [game_number, game_number + 1, game_number + 2], prediction_type)
             success = True
-    
-    if prediction_type == 'distribution' and DISTRIBUTION_CHANNEL_ID:
-        await send_prediction_to_channel(
-            DISTRIBUTION_CHANNEL_ID, game_number, suit, prediction_type, is_secondary=True
-        )
-    
-    elif prediction_type == 'compteur2' and COMPTEUR2_CHANNEL_ID:
-        await send_prediction_to_channel(
-            COMPTEUR2_CHANNEL_ID, game_number, suit, prediction_type, is_secondary=True
-        )
+            
+            # Envoyer aux canaux secondaires SEULEMENT si le canal principal a réussi
+            # et stocker le message ID pour pouvoir mettre à jour le résultat plus tard
+            secondary_channel_id = None
+            if prediction_type == 'distribution' and DISTRIBUTION_CHANNEL_ID:
+                secondary_channel_id = DISTRIBUTION_CHANNEL_ID
+            elif prediction_type == 'compteur2' and COMPTEUR2_CHANNEL_ID:
+                secondary_channel_id = COMPTEUR2_CHANNEL_ID
+            
+            if secondary_channel_id:
+                sec_msg_id = await send_prediction_to_channel(
+                    secondary_channel_id, game_number, suit, prediction_type, is_secondary=True
+                )
+                if sec_msg_id:
+                    pending_predictions[game_number]['secondary_message_id'] = sec_msg_id
+                    pending_predictions[game_number]['secondary_channel_id'] = secondary_channel_id
+                    logger.info(f"📡 Canal secondaire {secondary_channel_id}: #{game_number} envoyé (msg {sec_msg_id})")
+        else:
+            # Envoi échoué — retirer le placeholder pour ne pas bloquer le système
+            if game_number in pending_predictions and pending_predictions[game_number]['status'] == 'sending':
+                del pending_predictions[game_number]
+            last_prediction_number_sent = old_last  # restaurer l'ancien last
     
     if success and not pause_active:
         need_pause = increment_pause_counter()
         if need_pause:
-            logger.info(f"⏸️ La 4ème prédiction (#{game_number}) va déclencher la pause après vérification")
+            logger.info(f"⏸️ La {PREDICTIONS_BEFORE_PAUSE}ème prédiction (#{game_number}) va déclencher la pause après vérification")
     
     return success
 
 async def update_prediction_message(game_number: int, status: str, rattrapage: int = 0):
     """Met à jour le statut d'une prédiction (uniquement canal principal)."""
+    global pause_active, pause_counter, pause_cycle_index, pause_message_id, pause_end_time, pause_task
+    
     if game_number not in pending_predictions:
-        await check_and_trigger_pause(game_number)
+        logger.warning(f"⚠️ update_prediction_message: #{game_number} introuvable (déjà traité?)")
         return
     
     pred = pending_predictions[game_number]
     suit = pred['suit']
     msg_id = pred['message_id']
-    
     new_msg = format_prediction_message(game_number, suit, status, rattrapage=rattrapage)
     
+    if 'gagne' in status:
+        logger.info(f"✅ Gagné: #{game_number} (R{rattrapage})")
+    else:
+        logger.info(f"❌ Perdu: #{game_number}")
+        block_suit(suit, 5)
+    
+    # ── SECTION SYNCHRONE (aucun await) ─────────────────────────────────────
+    # Tout ce qui suit se fait AVANT le premier await.
+    # Cela garantit qu'aucune tâche concurrente ne peut s'intercaler.
+    
+    del pending_predictions[game_number]
+    
+    # Si les conditions de pause sont atteintes, verrouiller pause_active = True
+    # IMMÉDIATEMENT — avant tout await — pour bloquer les envois concurrents.
+    pause_to_start = False
+    pause_duration = None
+    if not pause_active and pause_counter >= PREDICTIONS_BEFORE_PAUSE and not pending_predictions:
+        pause_to_start = True
+        pause_duration = PAUSE_CYCLE[pause_cycle_index % len(PAUSE_CYCLE)]
+        pause_active = True  # ← VERROU INSTANTANÉ
+        pause_end_time = datetime.now() + timedelta(minutes=pause_duration)
+        logger.info(f"⏸️ Pause verrouillée ({pause_duration} min) — aucun envoi possible")
+    # ── FIN SECTION SYNCHRONE ────────────────────────────────────────────────
+    
+    # Éditer le message de prédiction — canal principal
     try:
         prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if not prediction_entity:
-            logger.error("❌ Canal principal non accessible pour mise à jour")
-            return
-            
-        await client.edit_message(prediction_entity, msg_id, new_msg, parse_mode='markdown')
-        pred['status'] = status
-        
-        if 'gagne' in status:
-            logger.info(f"✅ Gagné: #{game_number} (R{rattrapage})")
-        else:
-            logger.info(f"❌ Perdu: #{game_number}")
-            block_suit(suit, 5)
-        
-        del pending_predictions[game_number]
-        
-        await check_and_trigger_pause(game_number)
-        
+        if prediction_entity and msg_id:
+            await client.edit_message(prediction_entity, msg_id, new_msg, parse_mode='markdown')
+        elif not prediction_entity:
+            logger.error("❌ Canal principal inaccessible pour mise à jour")
     except Exception as e:
-        logger.error(f"❌ Erreur update message: {e}")
+        logger.error(f"❌ Erreur édition message #{game_number}: {e}")
+    
+    # Éditer le message de prédiction — canal secondaire (même contenu)
+    sec_msg_id = pred.get('secondary_message_id')
+    sec_channel_id = pred.get('secondary_channel_id')
+    if sec_msg_id and sec_channel_id:
+        try:
+            sec_entity = await resolve_channel(sec_channel_id)
+            if sec_entity:
+                await client.edit_message(sec_entity, sec_msg_id, new_msg, parse_mode='markdown')
+        except Exception as e:
+            logger.error(f"❌ Erreur édition canal secondaire #{game_number}: {e}")
+    
+    # Finaliser l'envoi du message de pause si nécessaire
+    if pause_to_start:
+        try:
+            prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+            if prediction_entity:
+                pause_msg = format_pause_message(pause_duration, pause_duration * 60)
+                sent = await client.send_message(prediction_entity, pause_msg, parse_mode='markdown')
+                pause_message_id = sent.id
+                pause_task = asyncio.create_task(pause_countdown_task(pause_duration))
+                logger.info(f"⏸️ PAUSE DÉMARRÉE: {pause_duration} min (cycle index: {pause_cycle_index})")
+        except Exception as e:
+            logger.error(f"❌ Erreur envoi message pause: {e}")
 
 async def update_prediction_progress(game_number: int, current_check: int):
     """Met à jour l'affichage de la progression (canal principal uniquement)."""
@@ -754,12 +823,24 @@ async def update_prediction_progress(game_number: int, current_check: int):
     
     msg = format_prediction_message(game_number, suit, 'en_cours', current_check, verified_games)
     
+    # Canal principal
     try:
         prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
         if prediction_entity:
             await client.edit_message(prediction_entity, msg_id, msg, parse_mode='markdown')
     except Exception as e:
         logger.error(f"❌ Erreur update progress: {e}")
+    
+    # Canal secondaire (synchronisation progression)
+    sec_msg_id = pred.get('secondary_message_id')
+    sec_channel_id = pred.get('secondary_channel_id')
+    if sec_msg_id and sec_channel_id:
+        try:
+            sec_entity = await resolve_channel(sec_channel_id)
+            if sec_entity:
+                await client.edit_message(sec_entity, sec_msg_id, msg, parse_mode='markdown')
+        except Exception as e:
+            logger.error(f"❌ Erreur update progress canal secondaire: {e}")
 
 async def check_prediction_result(game_number: int, first_group: str) -> bool:
     suits_in_result = get_suits_in_group(first_group)
@@ -932,10 +1013,11 @@ def can_accept_prediction(pred_number: int) -> bool:
             logger.info(f"⛔ Écart insuffisant avec dernier envoyé (#{last_prediction_number_sent}): {gap} < {MIN_GAP_BETWEEN_PREDICTIONS}")
             return False
     
-    for existing_num in pending_predictions.keys():
-        gap = abs(pred_number - existing_num)
+    # Vérifier l'écart contre les prédictions actuellement en cours de vérification
+    for active_num in pending_predictions:
+        gap = abs(pred_number - active_num)
         if gap < MIN_GAP_BETWEEN_PREDICTIONS:
-            logger.info(f"⛔ Écart insuffisant avec prédiction en cours (#{existing_num}): {gap} < {MIN_GAP_BETWEEN_PREDICTIONS}")
+            logger.info(f"⛔ Écart insuffisant avec prédiction active (#{active_num}): {gap} < {MIN_GAP_BETWEEN_PREDICTIONS}")
             return False
     
     for queued_pred in prediction_queue:
@@ -982,37 +1064,57 @@ async def process_prediction_queue(current_game: int):
     if pause_active:
         return
     
-    to_remove = []
+    # RÈGLE 1: Jamais de nouvelle prédiction si une est encore en cours de vérification
+    if pending_predictions:
+        logger.info(f"⏳ {len(pending_predictions)} prédiction(s) en cours, file en attente")
+        return
     
-    for pred in prediction_queue:
+    to_remove = []
+    to_send = None
+    
+    for pred in list(prediction_queue):
         pred_number = pred['game_number']
         suit = pred['suit']
         pred_type = pred['type']
         
-        if current_game >= pred_number - PREDICTION_SEND_AHEAD:
-            if pending_predictions:
-                can_send = True
-                for active_num in pending_predictions.keys():
-                    gap = abs(pred_number - active_num)
-                    if gap < MIN_GAP_BETWEEN_PREDICTIONS:
-                        logger.info(f"⏳ Prédiction #{pred_number} attend - conflit avec active #{active_num}")
-                        can_send = False
-                        break
-                
-                if not can_send:
-                    continue
-            
-            logger.info(f"📤 Envoi depuis file: #{pred_number} (canal à #{current_game})")
-            success = await send_prediction_multi_channel(pred_number, suit, pred_type)
-            
-            if success:
-                to_remove.append(pred)
-            else:
-                logger.warning(f"⚠️ Échec envoi #{pred_number}, conservation dans file")
+        # RÈGLE 2: Prédiction expirée — le moment optimal est passé (moins de PREDICTION_SEND_AHEAD jeux restants)
+        if current_game > pred_number - PREDICTION_SEND_AHEAD:
+            logger.warning(f"⏰ Prédiction #{pred_number} ({suit}) EXPIRÉE — canal à #{current_game}, trop tard")
+            to_remove.append(pred)
+            continue
+        
+        # RÈGLE 3: Envoyer uniquement quand on est exactement au bon moment (N-PREDICTION_SEND_AHEAD)
+        if current_game == pred_number - PREDICTION_SEND_AHEAD:
+            to_send = pred
+            break
     
+    # Nettoyer les expirées
     for pred in to_remove:
         prediction_queue.remove(pred)
-        logger.info(f"✅ #{pred['game_number']} retiré de la file. Restant: {len(prediction_queue)}")
+        logger.info(f"🗑️ #{pred['game_number']} retiré (expiré). Restant: {len(prediction_queue)}")
+    
+    # Envoyer la prédiction retenue
+    if to_send:
+        pred_number = to_send['game_number']
+        suit = to_send['suit']
+        pred_type = to_send['type']
+        
+        # Vérification finale juste avant envoi (protection race condition)
+        if pause_active:
+            logger.warning(f"⚠️ Pause détectée avant envoi #{pred_number}, annulé")
+            return
+        if pending_predictions:
+            logger.warning(f"⚠️ Prédiction active détectée avant envoi #{pred_number}, annulé")
+            return
+        
+        logger.info(f"📤 Envoi depuis file: #{pred_number} (canal à #{current_game})")
+        success = await send_prediction_multi_channel(pred_number, suit, pred_type)
+        
+        if success:
+            prediction_queue.remove(to_send)
+            logger.info(f"✅ #{pred_number} envoyé et retiré de la file. Restant: {len(prediction_queue)}")
+        else:
+            logger.warning(f"⚠️ Échec envoi #{pred_number}, conservation dans file")
 
 # ============================================================================
 # TRAITEMENT DES MESSAGES (CORRIGÉ avec Compteur1)
@@ -1167,19 +1269,62 @@ async def notify_admin_reset(reason: str, stats: int, queue_stats: int):
     except Exception as e:
         logger.error(f"❌ Impossible de notifier l'admin: {e}")
 
+async def cleanup_stale_predictions():
+    """Nettoie les prédictions bloquées depuis plus de PREDICTION_TIMEOUT_MINUTES."""
+    global pending_predictions
+    from config import PREDICTION_TIMEOUT_MINUTES
+    
+    now = datetime.now()
+    stale = []
+    
+    for game_number, pred in list(pending_predictions.items()):
+        sent_time = pred.get('sent_time')
+        if sent_time:
+            age_minutes = (now - sent_time).total_seconds() / 60
+            if age_minutes >= PREDICTION_TIMEOUT_MINUTES:
+                stale.append(game_number)
+    
+    for game_number in stale:
+        pred = pending_predictions.get(game_number)
+        if pred:
+            suit = pred.get('suit', '?')
+            age = int((now - pred['sent_time']).total_seconds() / 60)
+            logger.warning(f"🧹 Prédiction #{game_number} ({suit}) supprimée — bloquée depuis {age} min (timeout {PREDICTION_TIMEOUT_MINUTES} min)")
+            
+            # Tenter d'éditer le message pour indiquer l'expiration
+            try:
+                prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+                if prediction_entity and pred.get('message_id'):
+                    suit_display = SUIT_DISPLAY.get(suit, suit)
+                    expired_msg = f"⏱️ **PRÉDICTION #{game_number}**\n\n🎯 **Couleur:** {suit_display}\n⚠️ **Statut:** EXPIRÉE (timeout)"
+                    await client.edit_message(prediction_entity, pred['message_id'], expired_msg, parse_mode='markdown')
+            except Exception as e:
+                logger.error(f"❌ Impossible d'éditer message expiré #{game_number}: {e}")
+            
+            del pending_predictions[game_number]
+    
+    if stale:
+        logger.info(f"🧹 {len(stale)} prédiction(s) expirée(s) nettoyée(s)")
+
+
 async def auto_reset_system():
-    """Mode veille avec vérification de pause bloquée."""
+    """Mode veille avec vérification de pause bloquée et prédictions expirées."""
     global pause_active, pause_end_time
     
     while True:
         try:
             await asyncio.sleep(60)
             
+            # Vérifier pause bloquée
             if pause_active and pause_end_time:
                 remaining = (pause_end_time - datetime.now()).total_seconds()
                 if remaining <= -30:
                     logger.warning("🚨 Pause bloquée détectée (temps dépassé), auto-correction...")
                     await end_pause()
+            
+            # Nettoyer les prédictions bloquées (timeout)
+            if pending_predictions:
+                await cleanup_stale_predictions()
                     
         except Exception as e:
             logger.error(f"❌ Erreur auto_reset: {e}")
@@ -1795,7 +1940,7 @@ async def cmd_canal_compteur2(event):
                 await event.respond(
                     f"📊 **CANAL COMPTEUR2**\n\n"
                     f"✅ Actif: `{COMPTEUR2_CHANNEL_ID}`\n\n"
-                    f"**Usage:** `/canalcompteur2 ID]` ou `/canalcompteur2 off`"
+                    f"**Usage:** `/canalcompteur2 [ID]` ou `/canalcompteur2 off`"
                 )
             else:
                 await event.respond(
@@ -2021,6 +2166,8 @@ async def cmd_status(event):
     # Compter costumes bloqués
     blocked_count = sum(1 for v in blocked_suits_for_distribution.values() if v)
     
+    now = datetime.now()
+    
     lines = [
         "📊 **STATUT COMPLET**",
         "",
@@ -2037,6 +2184,19 @@ async def cmd_status(event):
         f"🎯 Distrib: {DISTRIBUTION_CHANNEL_ID or '❌'}",
         f"📊 C2: {COMPTEUR2_CHANNEL_ID or '❌'}",
     ]
+    
+    if pending_predictions:
+        lines.append("")
+        lines.append("🔍 **En vérification:**")
+        for game_number, pred in pending_predictions.items():
+            suit_display = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
+            rattrapage = pred.get('rattrapage', 0)
+            sent_time = pred.get('sent_time')
+            age_str = ""
+            if sent_time:
+                age_sec = int((now - sent_time).total_seconds())
+                age_str = f" ({age_sec//60}m{age_sec%60:02d}s)"
+            lines.append(f"  • #{game_number} {suit_display} — R{rattrapage}{age_str}")
     
     await event.respond("\n".join(lines))
 
@@ -2070,6 +2230,7 @@ async def cmd_help(event):
 `/pauseadd [texte]` - Ajouter expression
 
 **📋 Gestion:**
+`/pending` - Prédictions en cours de vérification
 `/queue` - File d'attente
 `/status` - Statut complet
 `/history` - Historique
@@ -2078,6 +2239,72 @@ async def cmd_help(event):
 🤖 Baccarat AI | By Sossou Kouamé"""
     
     await event.respond(help_text)
+
+async def cmd_pending(event):
+    """Affiche les prédictions en cours de vérification."""
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    
+    from config import PREDICTION_TIMEOUT_MINUTES
+    now = datetime.now()
+    
+    try:
+        if not pending_predictions:
+            await event.respond("✅ **Aucune prédiction en cours**\n\nLe bot est prêt à envoyer la prochaine.")
+            return
+        
+        lines = [
+            f"🔍 **PRÉDICTIONS EN COURS** ({len(pending_predictions)})",
+            ""
+        ]
+        
+        for game_number, pred in pending_predictions.items():
+            suit = pred.get('suit', '?')
+            suit_display = SUIT_DISPLAY.get(suit, suit)
+            rattrapage = pred.get('rattrapage', 0)
+            current_check = pred.get('current_check', game_number)
+            verified_games = pred.get('verified_games', [])
+            sent_time = pred.get('sent_time')
+            pred_type = pred.get('type', 'standard')
+            
+            type_str = "🎯#R" if pred_type == 'distribution' else "📊C2" if pred_type == 'compteur2' else "🤖"
+            
+            age_str = ""
+            timeout_str = ""
+            if sent_time:
+                age_sec = int((now - sent_time).total_seconds())
+                age_min = age_sec // 60
+                age_sec_r = age_sec % 60
+                age_str = f"{age_min}m{age_sec_r:02d}s"
+                remaining_min = PREDICTION_TIMEOUT_MINUTES - age_min
+                timeout_str = f" | Timeout: {remaining_min}min"
+            
+            verif_parts = []
+            for i in range(3):
+                check_num = game_number + i
+                if current_check == check_num:
+                    verif_parts.append(f"🔵#{check_num}")
+                elif check_num in verified_games:
+                    verif_parts.append(f"❌#{check_num}")
+                else:
+                    verif_parts.append(f"⬜#{check_num}")
+            
+            lines.append(f"**#{game_number}** {suit_display} | {type_str} | R{rattrapage}")
+            lines.append(f"  🔍 {' | '.join(verif_parts)}")
+            lines.append(f"  ⏱️ Envoyé il y a {age_str}{timeout_str}")
+            lines.append("")
+        
+        lines.append(f"🎮 Canal source: #{current_game_number}")
+        
+        await event.respond("\n".join(lines))
+        
+    except Exception as e:
+        logger.error(f"Erreur cmd_pending: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
 
 async def cmd_reset(event):
     if event.is_group or event.is_channel:
@@ -2119,6 +2346,7 @@ def setup_handlers():
     
     # Gestion
     client.add_event_handler(cmd_queue, events.NewMessage(pattern=r'^/queue$'))
+    client.add_event_handler(cmd_pending, events.NewMessage(pattern=r'^/pending$'))
     client.add_event_handler(cmd_compteur2, events.NewMessage(pattern=r'^/compteur2'))
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
     client.add_event_handler(cmd_history, events.NewMessage(pattern=r'^/history$'))

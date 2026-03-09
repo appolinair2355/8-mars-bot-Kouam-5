@@ -1,11 +1,3 @@
-# BACCARAT AI 🤖
-# Dépendances du bot de prédiction Telegram
-
-# Client Telegram
- telethon>=1.28.5
-
-# Serveur web pour health checks
+telethon>=1.28.5
 aiohttp>=3.8.4
-
-# Utilitaires
 python-dateutil>=2.8.2
